@@ -2,10 +2,49 @@ import AppKit
 
 /// Outline nodes. `NSOutlineView` needs object identity, and `Profile` /
 /// `SessionInfo` are value types, so they are wrapped rather than used directly.
+/// Reachability of a connection, as last observed.
+///
+/// Three states rather than two because "reachable but degraded" is a real and
+/// actionable condition here: the runtime can be answering perfectly while
+/// reporting leaked processes or a drain in progress, and a client that shows
+/// that as plain green is hiding something the operator should see.
+enum ConnectionHealth {
+    case unknown            // never queried
+    case ok                 // answering, nothing flagged
+    case degraded(String)   // answering, but something is wrong
+    case down(String)       // not answering, or refusing the credential
+
+    var lamp: String {
+        switch self {
+        case .unknown:  return "○"
+        case .ok:       return "●"
+        case .degraded: return "●"
+        case .down:     return "●"
+        }
+    }
+
+    var colour: NSColor {
+        switch self {
+        case .unknown:  return .tertiaryLabelColor
+        case .ok:       return .systemGreen
+        case .degraded: return .systemYellow
+        case .down:     return .systemRed
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .unknown, .ok: return nil
+        case .degraded(let m), .down(let m): return m
+        }
+    }
+}
+
 final class ConnectionNode {
     let profile: Profile
     var sessions: [SessionNode] = []
-    var statusLine: String = "not loaded"
+    var statusLine: String = "not queried yet"
+    var health: ConnectionHealth = .unknown
     init(profile: Profile) { self.profile = profile }
 }
 
@@ -133,6 +172,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         for node in nodes {
             guard let api = client(for: node) else {
                 node.statusLine = "credential missing from Keychain"
+                node.health = .down("credential missing from Keychain")
+                outline.reloadData()
                 continue
             }
             Task { @MainActor in
@@ -148,12 +189,29 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                     }
                     if listing.draining { parts.append("draining") }
                     node.statusLine = parts.joined(separator: " · ")
+                    // Amber for conditions the runtime reports about itself:
+                    // a leaked process means Tier 1 teardown did not converge,
+                    // and draining means it is going away.
+                    if listing.killDomain.leakedProcesses > 0 {
+                        node.health = .degraded("\(listing.killDomain.leakedProcesses) leaked process(es)")
+                    } else if listing.draining {
+                        node.health = .degraded("runtime is draining")
+                    } else {
+                        node.health = .ok
+                    }
                     self.outline.reloadData()
                     self.outline.expandItem(node)
                     self.delegate?.sidebar(self, didReportStatus:
                         "\(node.profile.name): \(listing.sessions.count) session(s) · \(node.statusLine)")
                 } catch {
                     node.statusLine = error.localizedDescription
+                    // A refused credential is a different problem from an
+                    // unreachable host, and the user fixes them differently.
+                    if case ApiError.unauthorized = error {
+                        node.health = .down("credential rejected")
+                    } else {
+                        node.health = .down(error.localizedDescription)
+                    }
                     node.sessions = []
                     self.outline.reloadData()
                     self.delegate?.sidebar(self, didReportStatus: "\(node.profile.name): \(error.localizedDescription)")
@@ -296,28 +354,54 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         let text: String
         let secondary: String
+        let lamp: String
+        let lampColour: NSColor
+
         if let c = item as? ConnectionNode {
             text = c.profile.name
-            secondary = c.profile.baseURL
+            // Show why it is not green, in place: the URL is only useful when
+            // everything works, and the reason is what you act on when it does not.
+            secondary = c.health.detail ?? c.profile.baseURL
+            lamp = c.health.lamp
+            lampColour = c.health.colour
         } else if let s = item as? SessionNode {
             text = s.info.name
             secondary = s.info.alive ? (s.info.attached ? "attached" : "detached · alive") : "dead"
+            // A session lamp tracks the session, not the host: green while a
+            // client holds it, amber when it is alive but nobody is attached,
+            // red once the shell is gone.
+            lamp = "●"
+            lampColour = s.info.alive ? (s.info.attached ? .systemGreen : .systemYellow) : .systemRed
         } else {
             return nil
         }
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 0
+
+        let lampField = NSTextField(labelWithString: lamp)
+        lampField.font = .systemFont(ofSize: 13)
+        lampField.textColor = lampColour
+        lampField.setContentHuggingPriority(.required, for: .horizontal)
+        // Colour alone is not a signal for everyone who will read this, so the
+        // reason is always available as text next to it.
+        lampField.toolTip = (item as? ConnectionNode)?.health.detail ?? secondary
+
         let title = NSTextField(labelWithString: text)
         title.font = (item is ConnectionNode) ? .systemFont(ofSize: 12, weight: .semibold)
                                               : .systemFont(ofSize: 12)
         let sub = NSTextField(labelWithString: secondary)
         sub.font = .systemFont(ofSize: 10)
         sub.textColor = .secondaryLabelColor
-        stack.addView(title, in: .leading)
-        stack.addView(sub, in: .leading)
-        return stack
+        sub.lineBreakMode = .byTruncatingTail
+
+        let labels = NSStackView(views: [title, sub])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 0
+
+        let row = NSStackView(views: [lampField, labels])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        return row
     }
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat { 34 }
