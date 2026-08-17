@@ -1,0 +1,151 @@
+name: image
+
+# Builds the internal image. Nothing here publishes anything: the target is a
+# private ECR repository in the account that runs the Fargate deployment, and
+# Gate B on openabdev/openab#1479 — which governs *publishing* an image, chart or
+# docs — stays closed. If this ever grows a public push, that gate has to move
+# first.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: openab-pty
+  # Names the base variant, because the base decides which agent CLI a session
+  # lands next to. Change the base and this changes with it.
+  VARIANT: kiro
+
+jobs:
+  # The image is built from whatever the tests ran against, not in parallel with
+  # them. Publishing an artifact whose test result is still unknown is how a red
+  # gate ends up shipping.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Required to request the OIDC token. Deliberately no `packages:` scope:
+      # this workflow has no business touching GHCR.
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Work out the tags
+        id: meta
+        run: |
+          SHORT="$(git rev-parse --short HEAD)"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          # A moving tag for convenience plus an immutable one for provenance.
+          # Deploying the moving tag alone makes "which code is running"
+          # unanswerable after the fact.
+          echo "tags=pre-beta-${VARIANT},${VARIANT}-${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Pull requests build but do not push: the role's trust policy only admits
+      # refs/heads/main and refs/tags/*, so a fork PR could not push even if this
+      # workflow asked it to. The build itself is still worth running — the base
+      # image and the musl link step are where a break would show up.
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/openab-pty-ci
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.event_name != 'pull_request'
+        id: login
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
+
+      - name: Build (and push, off a pull request)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          # linux/amd64 only. Both deployment targets are amd64, and an arm64 leg
+          # would roughly double the build for nothing that currently runs.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ github.event_name != 'pull_request' && format('{0}/{1}:pre-beta-{2},{0}/{1}:{2}-{3}', steps.login.outputs.registry, env.ECR_REPOSITORY, env.VARIANT, steps.meta.outputs.short) || 'openab-pty:pr' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      # Prove the thing starts and enforces its own contract, rather than
+      # assuming a successful build means a working image. Both checks below have
+      # failed for real reasons before: an entrypoint that could not find its
+      # config, and a listener that refused to bind.
+      - name: Smoke test the built image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.VARIANT }}-${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$IMAGE"
+
+          # 1. It must refuse to start without an admin credential hash, rather
+          #    than coming up with authentication disabled.
+          if docker run --rm "$IMAGE" --version >/dev/null 2>&1; then
+            echo "FAIL: started with no PTY_ADMIN_HASH" >&2; exit 1
+          fi
+          echo "ok: refuses to start without PTY_ADMIN_HASH"
+
+          CRED="$(openssl rand -hex 32)"
+          HASH="sha256:$(printf '%s' "$CRED" | sha256sum | cut -d' ' -f1)"
+
+          # 2. It must refuse an off-loopback bind while it holds no TLS key.
+          if docker run --rm -e PTY_ADMIN_HASH="$HASH" -e PTY_LISTEN=0.0.0.0:8090 \
+               "$IMAGE" >/dev/null 2>&1; then
+            echo "FAIL: bound off-loopback with no TLS terminator" >&2; exit 1
+          fi
+          echo "ok: fail-closed listener guard holds"
+
+          docker run -d --name pty --read-only --tmpfs /tmp --tmpfs /workspace \
+            -e PTY_ADMIN_HASH="$HASH" "$IMAGE" >/dev/null
+          for i in $(seq 1 20); do
+            docker exec pty curl -sf -o /dev/null --max-time 2 \
+              -H "Authorization: Bearer $CRED" http://127.0.0.1:8090/admin/sessions && break
+            sleep 1
+          done
+
+          # 3. The admin plane must answer the credential and refuse its absence.
+          docker exec pty curl -sf --max-time 5 -H "Authorization: Bearer $CRED" \
+            http://127.0.0.1:8090/admin/sessions >/dev/null
+          echo "ok: admin plane authenticates"
+          CODE="$(docker exec pty curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            http://127.0.0.1:8090/admin/sessions)"
+          [ "$CODE" = "401" ] || { echo "FAIL: unauthenticated admin got $CODE, expected 401" >&2; exit 1; }
+          echo "ok: unauthenticated admin request gets 401"
+
+          # 4. The sandbox properties the ADR claims must actually hold.
+          docker exec pty sh -c '[ "$(id -u)" = 1000 ]' || { echo "FAIL: not uid 1000" >&2; exit 1; }
+          docker exec pty sh -c '! command -v sudo >/dev/null' || { echo "FAIL: sudo present" >&2; exit 1; }
+          docker exec pty sh -c '! touch /probe 2>/dev/null' || { echo "FAIL: root filesystem writable" >&2; exit 1; }
+          echo "ok: uid 1000, no sudo, read-only root filesystem"
+
+          docker rm -f pty >/dev/null
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.VARIANT }}-${{ steps.meta.outputs.short }}"
+            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pre-beta-${{ env.VARIANT }}"
+            echo '```'
+            echo
+            echo "Private ECR. Not published — Gate B on openabdev/openab#1479 stays closed."
+          } >> "$GITHUB_STEP_SUMMARY"

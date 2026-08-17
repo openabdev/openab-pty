@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+# Least privilege by default; the image workflow asks for more where it needs it.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  runtime:
+    name: runtime (${{ matrix.os }})
+    # Both, because the crate gates Linux-only mechanisms behind cfg and the
+    # macOS leg is what proves those gates actually hold.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: runtime
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: runtime
+
+      # Ordered so a formatting nit cannot mask a test failure. The previous
+      # workflow put fmt first and failed fast, and the result was that clippy
+      # and all 105 unit tests never executed on any head for four consecutive
+      # revisions. The gate was in front of the evidence.
+      - run: cargo check --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # The e2e suite is #[ignore]d because it binds a port and spawns shells.
+      # Running it explicitly is the whole point: it is the only coverage of
+      # attach, replay cursors, takeover CAS, renew eviction, restart and
+      # shutdown drain.
+      - run: cargo test --locked -- --ignored --test-threads=1
+      - run: cargo fmt --check
+
+  macos-client:
+    name: macos client
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: swift build -c release
+        working-directory: clients/macos

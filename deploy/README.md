@@ -36,3 +36,24 @@ are documented anywhere obvious:
 
 Replace `SUFFIX` in the secret ARN with the real one, and point the image at your
 own registry.
+
+## CI-built image (ECR)
+
+`.github/workflows/image.yml` builds this Dockerfile on every push to `main` and
+tag, and pushes to a private ECR repository (`openab-pty` in `123456789012`,
+`us-east-1`) — not GHCR. Authentication is GitHub OIDC to a scoped IAM role
+(`openab-pty-ci`, trust condition restricted to `refs/heads/main` and
+`refs/tags/*` in this repository), so no long-lived credential is stored
+anywhere. The role can push and pull exactly this one ECR repository and
+nothing else.
+
+This does not touch Gate B. Gate B on openabdev/openab#1479 governs *publishing*
+an image, chart or docs; a private-account ECR push that nothing points a user
+at is neither.
+
+The base image (`ghcr.io/openabdev/openab`) is pinned by digest, matched to the
+fleet's `pre-beta-kiro` tag rather than `:latest` — the two were different
+images (openab 0.10.0 vs 0.9.0) when this was pinned. A scheduled workflow
+(`bump-base-image.yml`) re-resolves that tag weekly and opens a PR if it moved,
+so staying current is a reviewed decision rather than a build silently
+re-resolving a tag on every run.
