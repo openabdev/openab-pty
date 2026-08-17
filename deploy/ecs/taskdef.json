@@ -1,0 +1,56 @@
+{
+  "family": "openab-pty-test",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "1024", "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/openab-pty-test-execution-role",
+  "ephemeralStorage": {"sizeInGiB": 21},
+  "containerDefinitions": [
+    {
+      "name": "init-perms",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro",
+      "essential": false,
+      "user": "0",
+      "entryPoint": ["/bin/sh","-c"],
+      "command": ["chown 1000:1000 /workspace /tmp /run/openab-pty && chmod 700 /run/openab-pty && echo 'volumes chowned to uid 1000'"],
+      "mountPoints": [
+        {"sourceVolume":"workspace","containerPath":"/workspace"},
+        {"sourceVolume":"tmp","containerPath":"/tmp"},
+        {"sourceVolume":"runtime-state","containerPath":"/run/openab-pty"}
+      ],
+      "logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/openab-pty-test","awslogs-region":"us-east-1","awslogs-stream-prefix":"init"}}
+    },
+    {
+      "name": "tailscale",
+      "image": "tailscale/tailscale:stable",
+      "essential": true,
+      "user": "0",
+      "entryPoint": ["/bin/sh","-c"],
+      "command": ["set -e; mkdir -p /tmp/tsstate; tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/tailscaled.sock >/tmp/tailscaled.log 2>&1 & for i in $(seq 1 60); do [ -S /tmp/tailscaled.sock ] && break; sleep 1; done; echo \"socket present after ${i}s\"; tailscale --socket=/tmp/tailscaled.sock up --authkey=\"$TS_AUTHKEY\" --hostname=oab-pty-fargate --accept-dns=false; echo 'tailnet up:'; tailscale --socket=/tmp/tailscaled.sock ip -4; tail -f /tmp/tailscaled.log"],
+      "secrets": [{"name":"TS_AUTHKEY","valueFrom":"arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-SUFFIX:TS_AUTHKEY::"}],
+      "logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/openab-pty-test","awslogs-region":"us-east-1","awslogs-stream-prefix":"ts"}}
+    },
+    {
+      "name": "openab-pty",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro",
+      "essential": true,
+      "user": "1000",
+      "readonlyRootFilesystem": true,
+      "linuxParameters": {"capabilities": {"drop": ["ALL"]}},
+      "dependsOn": [{"containerName":"init-perms","condition":"SUCCESS"}],
+      "environment": [
+        {"name":"PTY_LISTEN","value":"127.0.0.1:8090"},
+        {"name":"PTY_COMMAND","value":"/usr/bin/bash"},
+        {"name":"HOME","value":"/workspace"}
+      ],
+      "secrets": [{"name":"PTY_ADMIN_HASH","valueFrom":"arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-SUFFIX:PTY_ADMIN_HASH::"}],
+      "mountPoints": [
+        {"sourceVolume":"workspace","containerPath":"/workspace"},
+        {"sourceVolume":"tmp","containerPath":"/tmp"},
+        {"sourceVolume":"runtime-state","containerPath":"/run/openab-pty"}
+      ],
+      "logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/openab-pty-test","awslogs-region":"us-east-1","awslogs-stream-prefix":"pty"}}
+    }
+  ],
+  "volumes": [{"name":"workspace"},{"name":"tmp"},{"name":"runtime-state"}]
+}

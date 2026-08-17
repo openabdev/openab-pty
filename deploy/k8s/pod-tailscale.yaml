@@ -1,0 +1,140 @@
+# openab-pty with its own tailnet identity.
+#
+# What changes versus the hostPort version: the runtime binds **loopback only**
+# and there is no hostPort on any interface. The single way in is the tailnet,
+# through a userspace tailscaled sidecar that shares this pod's network
+# namespace and forwards inbound connections to 127.0.0.1.
+#
+# Consequences, each deliberate:
+#   - No LAN or host exposure. Previously two hostIPs were bound; now zero.
+#   - The runtime's own fail-closed guard permits a loopback bind unconditionally,
+#     so `tls_terminated_upstream` is false here and honest: nothing is served
+#     off-loopback, and the encrypted hop is WireGuard rather than a claimed
+#     upstream TLS terminator.
+#   - The pod is its own tailnet node with its own identity and ACL scope. It does
+#     not borrow p1's tailscale connection, so "can reach p1" no longer implies
+#     "can reach this terminal".
+#   - Userspace networking needs neither NET_ADMIN nor /dev/net/tun, so the ADR's
+#     container contract (non-root, all capabilities dropped) survives intact for
+#     both containers.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: openab-pty
+  namespace: default
+  labels:
+    app: openab-pty
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    # ---------------------------------------------------------------- tailscale
+    - name: tailscale
+      image: tailscale/tailscale:stable
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef: { name: openab-pty-tailscale, key: authkey }
+        # Userspace networking: no TUN device, no NET_ADMIN. Inbound connections
+        # to this node's tailnet address are proxied to 127.0.0.1, which is
+        # exactly the shape we want — the runtime never leaves loopback.
+        - name: TS_USERSPACE
+          value: "true"
+        - name: TS_HOSTNAME
+          value: "oab-pty-p1"
+        - name: TS_STATE_DIR
+          value: /tmp/tsstate
+        # containerboot defaults to storing tailscaled state in a Kubernetes
+        # Secret, which needs a service-account token. We deliberately set
+        # automountServiceAccountToken: false -- a session child being unable to
+        # read a SA token is one of the sandbox properties this deployment
+        # exists to demonstrate, and that setting is pod-level, so enabling it
+        # for the sidecar would also hand one to the terminal container. Empty
+        # value = use TS_STATE_DIR on disk instead.
+        - name: TS_KUBE_SECRET
+          value: ""
+        - name: TS_EXTRA_ARGS
+          # --accept-dns=false: this pod has no business rewriting its own
+          # resolver, and MagicDNS is not needed for inbound.
+          value: "--accept-dns=false"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { memory: 64Mi, cpu: 50m }
+        limits: { memory: 192Mi, cpu: 500m }
+      volumeMounts:
+        - name: ts-state
+          mountPath: /tmp/tsstate
+        - name: ts-tmp
+          mountPath: /tmp
+
+    # --------------------------------------------------------------- openab-pty
+    - name: openab-pty
+      image: ghcr.io/openabdev/openab:latest
+      imagePullPolicy: IfNotPresent
+      command: ["/runtime/openab-pty"]
+      args: ["--config", "/etc/openab-pty/config.toml"]
+      env:
+        - name: HOME
+          value: /workspace
+        - name: RUST_LOG
+          value: info
+      # No ports block at all: nothing is published to the host.
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { memory: 128Mi, cpu: 100m }
+        limits: { memory: 512Mi, cpu: "1" }
+      volumeMounts:
+        - name: runtime
+          mountPath: /runtime
+          readOnly: true
+        - name: config
+          mountPath: /etc/openab-pty
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace
+        - name: runtime-state
+          mountPath: /run/openab-pty
+        - name: tmp
+          mountPath: /tmp
+
+  volumes:
+    - name: runtime
+      hostPath:
+        path: /home/builder/oab-pty/crates/openab-pty/target/x86_64-unknown-linux-musl/release
+        type: Directory
+    - name: config
+      configMap:
+        name: openab-pty-config
+        items:
+          - key: config.toml
+            path: config.toml
+    - name: workspace
+      emptyDir: {}
+    - name: runtime-state
+      emptyDir: { medium: Memory, sizeLimit: 16Mi }
+    - name: tmp
+      emptyDir: { sizeLimit: 512Mi }
+    # tailscaled state. An ephemeral auth key means a replaced pod is removed
+    # from the tailnet rather than accumulating dead nodes, which is the failure
+    # the fleet already hit ("a new b0-N device per restart").
+    - name: ts-state
+      emptyDir: {}
+    - name: ts-tmp
+      emptyDir: {}
