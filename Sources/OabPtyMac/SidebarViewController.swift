@@ -60,6 +60,9 @@ final class SessionNode {
 protocol SidebarDelegate: AnyObject {
     func sidebar(_ sidebar: SidebarViewController, didChoose session: SessionNode)
     func sidebar(_ sidebar: SidebarViewController, didReportStatus text: String)
+    /// The session is gone or its process was replaced, so any pane showing it is
+    /// stale and must not keep pretending to be connected.
+    func sidebar(_ sidebar: SidebarViewController, didInvalidateSessionNamed name: String)
 }
 
 /// Left pane: agent connections, each expanding to its live sessions.
@@ -100,6 +103,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         outline.delegate = self
         outline.target = self
         outline.doubleAction = #selector(openSelected)
+        let menu = NSMenu()
+        menu.delegate = self
+        outline.menu = menu
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
         column.width = 230
         outline.addTableColumn(column)
@@ -335,6 +341,90 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     func apiClient(for node: ConnectionNode) -> ApiClient? { client(for: node) }
 
+    // MARK: context menu
+
+    /// The row the menu was opened on, which is not necessarily the selected row.
+    private func contextItem() -> Any? {
+        let row = outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow
+        guard row >= 0 else { return nil }
+        return outline.item(atRow: row)
+    }
+
+    @objc private func menuAttach() {
+        guard let s = contextItem() as? SessionNode else { return }
+        delegate?.sidebar(self, didChoose: s)
+    }
+
+    @objc private func menuRenew() {
+        guard let s = contextItem() as? SessionNode, let api = client(for: s.connection) else { return }
+        let name = s.info.name
+        Task { @MainActor in
+            do {
+                _ = try await api.renew(name: name)
+                // Renew evicts whoever holds the session, by design, so any pane
+                // showing it is now stale.
+                self.delegate?.sidebar(self, didInvalidateSessionNamed: name)
+                self.delegate?.sidebar(self, didReportStatus: "renewed " + name + "; reattach to continue")
+                self.refresh()
+            } catch {
+                self.complain("Renew failed for " + name + ": " + error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func menuRestart() {
+        guard let s = contextItem() as? SessionNode, let api = client(for: s.connection) else { return }
+        let name = s.info.name
+        if s.info.alive {
+            let alert = NSAlert()
+            alert.messageText = "Restart the session with a fresh shell?"
+            alert.informativeText = "The running process is replaced and its scrollback is discarded. Files in the shared workspace are not touched."
+            alert.addButton(withTitle: "Restart")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Task { @MainActor in
+            do {
+                _ = try await api.restart(name: name)
+                self.delegate?.sidebar(self, didInvalidateSessionNamed: name)
+                self.delegate?.sidebar(self, didReportStatus: "restarted " + name + " - attach for a fresh shell")
+                self.refresh()
+            } catch {
+                self.complain("Restart failed for " + name + ": " + error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func menuTerminate() {
+        guard let s = contextItem() as? SessionNode, let api = client(for: s.connection) else { return }
+        let name = s.info.name
+
+        // Confirm only when there is something to interrupt. A session whose shell
+        // already exited is occupying a slot and nothing else, so asking is noise.
+        if s.info.alive {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Terminate the session?"
+            alert.informativeText = "The running process is killed and its scrollback is lost.\n\n"
+                + "Files are not: the workspace is shared between the sessions on this host, "
+                + "so anything written there survives. Teardown is best-effort under this kill "
+                + "domain, so a process that left its process group may outlive the session."
+            alert.addButton(withTitle: "Terminate")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Task { @MainActor in
+            do {
+                try await api.kill(name: name)
+                self.delegate?.sidebar(self, didInvalidateSessionNamed: name)
+                self.delegate?.sidebar(self, didReportStatus: "terminated " + name)
+                self.refresh()
+            } catch {
+                self.complain("Terminate failed for " + name + ": " + error.localizedDescription)
+            }
+        }
+    }
+
     // MARK: outline data
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -406,4 +496,37 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat { 34 }
+}
+
+extension SidebarViewController: NSMenuDelegate {
+    /// Rebuilt on every open so the items match the row clicked, and so a session
+    /// whose shell exited offers Restart instead of Attach.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        switch contextItem() {
+        case let session as SessionNode:
+            if session.info.alive {
+                menu.addItem(withTitle: "Attach", action: #selector(menuAttach), keyEquivalent: "")
+            } else {
+                let dead = NSMenuItem(title: "Shell has exited", action: nil, keyEquivalent: "")
+                dead.isEnabled = false
+                menu.addItem(dead)
+            }
+            menu.addItem(withTitle: "Restart with a fresh shell", action: #selector(menuRestart), keyEquivalent: "")
+            menu.addItem(withTitle: "Renew token (evicts current client)", action: #selector(menuRenew), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: session.info.alive ? "Terminate..." : "Terminate",
+                         action: #selector(menuTerminate), keyEquivalent: "")
+        case is ConnectionNode:
+            menu.addItem(withTitle: "New session...", action: #selector(newSession), keyEquivalent: "")
+            menu.addItem(withTitle: "Refresh", action: #selector(refresh), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Remove connection...", action: #selector(removeConnection), keyEquivalent: "")
+        default:
+            let none = NSMenuItem(title: "No item", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+        }
+        for item in menu.items where item.action != nil { item.target = self }
+    }
 }

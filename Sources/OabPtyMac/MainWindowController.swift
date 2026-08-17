@@ -78,6 +78,20 @@ final class MainWindowController: NSWindowController, SidebarDelegate {
         status.stringValue = text
     }
 
+    /// A terminated, restarted or renewed session invalidates the pane showing it:
+    /// the connection is either dead or about to be evicted, and leaving the old
+    /// view on screen would present a terminal that silently accepts nothing.
+    func sidebar(_ sidebar: SidebarViewController, didInvalidateSessionNamed name: String) {
+        guard let pane = panes.removeValue(forKey: name) else { return }
+        pane.stop()
+        pane.view.removeFromSuperview()
+        pane.removeFromParent()
+        if currentPane === pane {
+            currentPane = nil
+            if let next = panes.values.first { present(next) } else { placeholder.isHidden = false }
+        }
+    }
+
     func sidebar(_ sidebar: SidebarViewController, didChoose session: SessionNode) {
         guard let api = sidebar.apiClient(for: session.connection) else {
             status.stringValue = "credential for \(session.connection.profile.name) is missing from the Keychain"
