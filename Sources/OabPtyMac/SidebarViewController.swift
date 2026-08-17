@@ -168,7 +168,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     // MARK: actions
 
-    @objc func refresh() {
+    @objc func refresh() {  // callable from the window after an attach
+
         for node in nodes {
             guard let api = client(for: node) else {
                 node.statusLine = "credential missing from Keychain"
