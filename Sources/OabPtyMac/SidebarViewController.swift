@@ -40,6 +40,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         newSessionButton.bezelStyle = .rounded
         newSessionButton.translatesAutoresizingMaskIntoConstraints = false
 
+        let removeButton = NSButton(title: "－", target: self, action: #selector(removeConnection))
+        removeButton.bezelStyle = .rounded
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+
         let refreshButton = NSButton(title: "↻", target: self, action: #selector(refresh))
         refreshButton.bezelStyle = .rounded
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
@@ -65,6 +69,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
         container.addSubview(addButton)
         container.addSubview(newSessionButton)
+        container.addSubview(removeButton)
         container.addSubview(refreshButton)
         container.addSubview(scroll)
         NSLayoutConstraint.activate([
@@ -73,7 +78,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             newSessionButton.topAnchor.constraint(equalTo: addButton.topAnchor),
             newSessionButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 6),
             refreshButton.topAnchor.constraint(equalTo: addButton.topAnchor),
-            refreshButton.leadingAnchor.constraint(equalTo: newSessionButton.trailingAnchor, constant: 6),
+            removeButton.topAnchor.constraint(equalTo: addButton.topAnchor),
+            removeButton.leadingAnchor.constraint(equalTo: newSessionButton.trailingAnchor, constant: 6),
+            refreshButton.topAnchor.constraint(equalTo: addButton.topAnchor),
+            refreshButton.leadingAnchor.constraint(equalTo: removeButton.trailingAnchor, constant: 6),
             refreshButton.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
             scroll.topAnchor.constraint(equalTo: addButton.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -95,12 +103,28 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         return ApiClient(profile: node.profile, credential: credential)
     }
 
+    /// The connection the user actually selected.
+    ///
+    /// Deliberately returns nil rather than falling back to the first entry:
+    /// silently creating a session on a different host than the one the user
+    /// meant is worse than refusing, and it is indistinguishable from "create
+    /// failed" when the sessions appear somewhere they were not expecting.
     private func selectedConnection() -> ConnectionNode? {
         let row = outline.selectedRow
-        guard row >= 0, let item = outline.item(atRow: row) else { return nodes.first }
+        guard row >= 0, let item = outline.item(atRow: row) else {
+            return nodes.count == 1 ? nodes.first : nil
+        }
         if let c = item as? ConnectionNode { return c }
         if let s = item as? SessionNode { return s.connection }
-        return nodes.first
+        return nil
+    }
+
+    private func complain(_ text: String) {
+        delegate?.sidebar(self, didReportStatus: text)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = text
+        alert.runModal()
     }
 
     // MARK: actions
@@ -178,8 +202,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     @objc private func newSession() {
-        guard let node = selectedConnection(), let api = client(for: node) else {
-            delegate?.sidebar(self, didReportStatus: "select a connection first")
+        guard let node = selectedConnection() else {
+            complain("Select a connection in the sidebar first — with more than one configured, this will not guess which host you meant.")
+            return
+        }
+        guard let api = client(for: node) else {
+            complain("The credential for \(node.profile.name) is missing from the Keychain. Re-add the connection.")
             return
         }
         let alert = NSAlert()
@@ -213,9 +241,31 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 self.delegate?.sidebar(self, didChoose: sessionNode)
                 self.refresh()
             } catch {
-                self.delegate?.sidebar(self, didReportStatus: error.localizedDescription)
+                self.complain("Could not create “\(name)” on \(node.profile.name): \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Remove a connection and its Keychain entry. Without this, a changed URL or
+    /// rotated credential leaves a dead entry in the list forever.
+    @objc private func removeConnection() {
+        guard let node = selectedConnection() else {
+            complain("Select the connection to remove.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Remove the connection “\(node.profile.name)”?"
+        alert.informativeText = "This forgets the URL and deletes its credential from the Keychain. Sessions on the host are left running."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Keychain.delete(profileName: node.profile.name)
+        var profiles = ProfileStore.load()
+        profiles.removeAll { $0.name == node.profile.name }
+        ProfileStore.save(profiles)
+        nodes = profiles.map(ConnectionNode.init)
+        outline.reloadData()
+        refresh()
     }
 
     @objc private func openSelected() {
