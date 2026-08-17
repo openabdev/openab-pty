@@ -29,6 +29,22 @@ enum SessionLabels {
         return (value?.isEmpty ?? true) ? nil : value
     }
 
+    /// Move every label from one connection name to another.
+    ///
+    /// Labels are keyed by connection name, so renaming a connection without this
+    /// orphans them: they stay in storage, invisible, and the sessions look
+    /// unlabelled. Silent data loss is worse than a missing feature.
+    static func migrate(fromProfile old: String, toProfile new: String) {
+        guard old != new else { return }
+        var map = all()
+        let prefix = old + "/"
+        for (k, v) in map where k.hasPrefix(prefix) {
+            map[new + "/" + String(k.dropFirst(prefix.count))] = v
+            map.removeValue(forKey: k)
+        }
+        UserDefaults.standard.set(map, forKey: key)
+    }
+
     static func set(_ label: String?, profile: String, session: String) {
         var map = all()
         let k = id(profile: profile, session: session)

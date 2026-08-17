@@ -395,6 +395,75 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         }
     }
 
+    /// Edit a connection: its name, its URL, and optionally its credential.
+    ///
+    /// The connection name is purely a local nickname — the runtime has never heard
+    /// of it — so unlike a session name this is a real rename rather than a label.
+    /// Two things must move with it or the connection silently breaks: the Keychain
+    /// entry, which is keyed by this name, and the session labels, which are keyed
+    /// by it too.
+    @objc private func editConnection() {
+        guard let node = selectedConnection() else {
+            complain("Select the connection to edit.")
+            return
+        }
+        let oldName = node.profile.name
+
+        let alert = NSAlert()
+        alert.messageText = "Edit the connection " + oldName
+        alert.informativeText = "Leave the credential empty to keep the one already in the Keychain."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 92))
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 64, width: 380, height: 24))
+        nameField.stringValue = oldName
+        let urlField = NSTextField(frame: NSRect(x: 0, y: 34, width: 380, height: 24))
+        urlField.stringValue = node.profile.baseURL
+        let credField = NSSecureTextField(frame: NSRect(x: 0, y: 4, width: 380, height: 24))
+        credField.placeholderString = "admin credential (unchanged if empty)"
+        form.addSubview(nameField); form.addSubview(urlField); form.addSubview(credField)
+        alert.accessoryView = form
+        alert.window.initialFirstResponder = nameField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let newName = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        let newURL = urlField.stringValue.trimmingCharacters(in: .whitespaces)
+        let newCred = credField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty, !newURL.isEmpty else {
+            complain("Name and base URL are both required.")
+            return
+        }
+        var profiles = ProfileStore.load()
+        if newName != oldName, profiles.contains(where: { $0.name == newName }) {
+            complain("A connection named " + newName + " already exists.")
+            return
+        }
+
+        // Carry the credential across before touching anything: losing it would
+        // leave a connection that shows red with "credential missing".
+        let credential = newCred.isEmpty ? Keychain.credential(for: oldName) : newCred
+        guard let credential else {
+            complain("No credential found for " + oldName + " and none supplied, so this would leave the connection unusable.")
+            return
+        }
+        do { try Keychain.save(credential: credential, for: newName) } catch {
+            complain(error.localizedDescription)
+            return
+        }
+        if newName != oldName {
+            Keychain.delete(profileName: oldName)
+            SessionLabels.migrate(fromProfile: oldName, toProfile: newName)
+        }
+        if let index = profiles.firstIndex(where: { $0.name == oldName }) {
+            profiles[index] = Profile(baseURL: newURL, name: newName)
+        }
+        ProfileStore.save(profiles)
+        nodes = profiles.map(ConnectionNode.init)
+        outline.reloadData()
+        refresh()
+    }
+
     @objc private func menuLabel() {
         guard let s = contextItem() as? SessionNode else { return }
         let profile = s.connection.profile.name
@@ -552,6 +621,7 @@ extension SidebarViewController: NSMenuDelegate {
             menu.addItem(withTitle: "New session...", action: #selector(newSession), keyEquivalent: "")
             menu.addItem(withTitle: "Refresh", action: #selector(refresh), keyEquivalent: "")
             menu.addItem(.separator())
+            menu.addItem(withTitle: "Edit connection...", action: #selector(editConnection), keyEquivalent: "")
             menu.addItem(withTitle: "Remove connection...", action: #selector(removeConnection), keyEquivalent: "")
         default:
             let none = NSMenuItem(title: "No item", action: nil, keyEquivalent: "")
