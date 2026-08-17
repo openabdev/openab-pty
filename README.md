@@ -18,6 +18,7 @@ this repository.
 | `runtime/CLIENT-CONTRACT.md` | Implementation spec for any client, captured from the running service rather than transcribed from source. |
 | `clients/macos/` | Native macOS client. SwiftTerm + `URLSessionWebSocketTask`, credential in the Keychain. |
 | `deploy/` | Kubernetes pod and ECS Fargate task definitions, both verified. |
+| [`docs/ecsctl-howto.md`](docs/ecsctl-howto.md) | Deploying on ECS Fargate with `ecsctl`, including every failure worth knowing about in advance. Operator notes, not user-facing docs. |
 
 ## What it is for
 

@@ -1,0 +1,95 @@
+apiVersion: ecsctl/v1
+kind: Service
+metadata:
+  name: pty-kiro
+  cluster: openab
+
+# openab-pty on its own, with kiro-cli available inside the session.
+#
+# Nothing extra is needed to "add kiro": the image is built FROM
+# ghcr.io/openabdev/openab:pre-beta-kiro, so kiro-cli is already on PATH
+# (verified: /usr/local/bin/kiro-cli, 2.8.1). That is the point of basing on the
+# OAB image rather than a slim one -- a session lands in the same toolchain an
+# agent uses.
+#
+# Reachability: the runtime binds 127.0.0.1 only and refuses an off-loopback
+# bind while it holds no TLS key, so the tailscale sidecar sharing this task's
+# network namespace is what makes it reachable, over WireGuard.
+#
+# Replace: subnets, securityGroups, the two role ARNs, and the secret ARN.
+spec:
+  cpu: "1024"
+  memory: "2048"
+  arch: X86_64
+  capacity: FARGATE
+  desiredCount: 1
+
+  subnets:
+    - subnet-0564da5939b9f37e8
+  securityGroups:
+    - sg-0bc22bce7e98d79b0
+  assignPublicIp: true
+
+  executionRoleArn: "arn:aws:iam::123456789012:role/openab-pty-test-execution-role"
+
+  # Fargate bind mounts are root-owned and there is no fsGroup equivalent, so a
+  # uid 1000 container cannot write to them until something chowns them.
+  volumes:
+    - name: workspace
+    - name: tmp
+
+  containers:
+    # Root, one-shot, must finish before the app container starts.
+    # essential: false is required, not stylistic -- AWS refuses a
+    # SUCCESS/COMPLETE dependency on an essential container.
+    - name: init-perms
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      essential: false
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      command:
+        - "chown 1000:1000 /workspace /tmp && chmod 700 /workspace && echo 'volumes chowned to uid 1000'"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/pty-kiro
+
+    # containerboot fails on Fargate (socket timeout in under a second), so
+    # tailscaled and `tailscale up` are driven directly.
+    - name: tailscale
+      image: tailscale/tailscale:stable
+      essential: true
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      command:
+        - 'set -e; mkdir -p /tmp/tsstate; tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/tailscaled.sock >/tmp/tailscaled.log 2>&1 & for i in $(seq 1 60); do [ -S /tmp/tailscaled.sock ] && break; sleep 1; done; tailscale --socket=/tmp/tailscaled.sock up --authkey="$TS_AUTHKEY" --hostname=pty-kiro --accept-dns=false; tailscale --socket=/tmp/tailscaled.sock ip -4; tail -f /tmp/tailscaled.log'
+      secrets:
+        TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:TS_AUTHKEY::"
+      logGroup: /ecs/pty-kiro
+
+    - name: openab-pty
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      essential: true
+      user: "1000"
+      readonlyRootFilesystem: true
+      linuxParameters:
+        capabilitiesDrop: ["ALL"]
+      dependsOn:
+        - containerName: init-perms
+          condition: SUCCESS
+      env:
+        PTY_LISTEN: 127.0.0.1:8090
+        # bash rather than kiro-cli: you want a shell you can run kiro-cli *from*,
+        # not a session that dies when the agent exits. `kiro-cli` is on PATH.
+        PTY_COMMAND: /usr/bin/bash
+        HOME: /workspace
+        PTY_MAX_SESSIONS: "3"
+      secrets:
+        # A hash, not the credential. The validator refuses ${VAR} on this key
+        # specifically, so the entrypoint materialises a projection containing the
+        # literal value. Generate with: openab-pty --generate-admin-credential
+        PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:PTY_ADMIN_HASH::"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/pty-kiro

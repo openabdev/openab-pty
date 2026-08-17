@@ -1,0 +1,126 @@
+apiVersion: ecsctl/v1
+kind: Service
+metadata:
+  name: kiro-with-pty
+  cluster: openab
+
+# The adjacency shape: an OAB kiro agent and a terminal into the same workspace,
+# in one task.
+#
+# This is what the PTY runtime exists for. The agent works in /workspace; you
+# attach a terminal that is already in that directory, with the same tools, and
+# can inspect or fix what the agent did without a second deployment, an SSH key,
+# or a public port.
+#
+# Four containers, and the ordering matters:
+#
+#   init-perms  root, chowns the shared volumes, exits         (essential: false)
+#   tailscale   joins the tailnet, proxies to loopback          (essential: true)
+#   openab      the agent: kiro-cli under the OAB broker        (essential: true)
+#   openab-pty  terminal into the same /workspace               (essential: true)
+#
+# Both openab and openab-pty mount `workspace`, which is the whole point --
+# and also the trust boundary to understand before deploying this: /workspace is
+# shared, so a terminal session can read and write anything the agent can, and
+# vice versa. One trust zone, by design. Do not put a session here that you would
+# not give the agent's filesystem access to.
+#
+# Replace: subnets, securityGroups, role ARNs, secret ARNs, the Discord channel,
+# and the tailscale hostname.
+spec:
+  # 2 vCPU / 4 GB: the agent and the terminal both run real workloads here, and
+  # kiro-cli is not small. 1024/2048 is enough for pty alone, not for both.
+  cpu: "2048"
+  memory: "4096"
+  arch: X86_64
+  capacity: FARGATE
+  desiredCount: 1
+
+  subnets:
+    - subnet-0564da5939b9f37e8
+  securityGroups:
+    - sg-0bc22bce7e98d79b0
+  assignPublicIp: true
+
+  executionRoleArn: "arn:aws:iam::123456789012:role/openab-pty-test-execution-role"
+  # The agent needs its own permissions (S3 state, Secrets Manager, whatever the
+  # bot does). openab-pty itself needs none -- it holds no AWS credentials, which
+  # is deliberate: a terminal session inheriting the task role would hand every
+  # session the agent's cloud permissions.
+  taskRoleArn: "arn:aws:iam::123456789012:role/openab-ecs-task-role"
+
+  volumes:
+    - name: workspace
+    - name: tmp
+
+  containers:
+    - name: init-perms
+      image: ghcr.io/openabdev/openab:pre-beta-kiro
+      essential: false
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      command:
+        - "chown 1000:1000 /workspace /tmp && chmod 700 /workspace && echo 'volumes chowned to uid 1000'"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/kiro-with-pty
+
+    - name: tailscale
+      image: tailscale/tailscale:stable
+      essential: true
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      command:
+        - 'set -e; mkdir -p /tmp/tsstate; tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/tailscaled.sock >/tmp/tailscaled.log 2>&1 & for i in $(seq 1 60); do [ -S /tmp/tailscaled.sock ] && break; sleep 1; done; tailscale --socket=/tmp/tailscaled.sock up --authkey="$TS_AUTHKEY" --hostname=kiro-with-pty --accept-dns=false; tailscale --socket=/tmp/tailscaled.sock ip -4; tail -f /tmp/tailscaled.log'
+      secrets:
+        TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:TS_AUTHKEY::"
+      logGroup: /ecs/kiro-with-pty
+
+    # The agent. Same image, same uid, same HOME as the terminal below -- that
+    # sameness is what makes the terminal useful rather than a separate box that
+    # happens to be nearby.
+    - name: openab
+      image: ghcr.io/openabdev/openab:pre-beta-kiro
+      essential: true
+      user: "1000"
+      dependsOn:
+        - containerName: init-perms
+          condition: SUCCESS
+      env:
+        HOME: /workspace
+        RUST_LOG: info
+        OPENAB_BACKEND_AGENT: kiro
+        OPENAB_AGENT_NAME: kiro-with-pty
+      secrets:
+        DISCORD_BOT_TOKEN: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab/b0-XXXXXX:DISCORD_BOT_TOKEN::"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/kiro-with-pty
+
+    # The terminal. Hardened harder than the agent, because it takes input from
+    # a human over the network: read-only root filesystem, no capabilities.
+    - name: openab-pty
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      essential: true
+      user: "1000"
+      readonlyRootFilesystem: true
+      linuxParameters:
+        capabilitiesDrop: ["ALL"]
+      dependsOn:
+        - containerName: init-perms
+          condition: SUCCESS
+      env:
+        PTY_LISTEN: 127.0.0.1:8090
+        PTY_COMMAND: /usr/bin/bash
+        HOME: /workspace
+        PTY_MAX_SESSIONS: "3"
+        PTY_ABSOLUTE_TTL: 12h
+        PTY_IDLE_TTL: 8h
+      secrets:
+        PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:PTY_ADMIN_HASH::"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/kiro-with-pty
