@@ -8,4 +8,18 @@
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+
+  <!-- App Transport Security blocks cleartext HTTP for bundled apps by default,
+       which is why every request failed with a red lamp. openab-pty deliberately
+       binds loopback and is reached over a WireGuard tailnet, so the hop is
+       already encrypted and there is no TLS terminator to present a certificate.
+       ATS cannot see that, so the exception is stated here rather than worked
+       around by pretending to run TLS.
+
+       When a deployment does terminate TLS at an Ingress (the ADR's other
+       supported shape), the client uses wss:// and this exception is unused. -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoads</key><true/>
+  </dict>
 </dict></plist>
