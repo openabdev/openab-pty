@@ -49,15 +49,15 @@ flowchart LR
     client -->|"WSS/HTTP over WireGuard<br/>Bearer credential"| tailnet
     tailnet --> tsd
 
-    classDef root fill:#fde8e8,stroke:#c53030,color:#742a2a
-    classDef hardened fill:#e6fffa,stroke:#2c7a7b,color:#234e52
-    classDef store fill:#fffaf0,stroke:#b7791f,color:#744210
+    classDef root fill:#e53e3e22,stroke:#e53e3e,stroke-width:2px
+    classDef hardened fill:#38b2ac22,stroke:#38b2ac,stroke-width:2px
+    classDef store fill:#d69e2e22,stroke:#d69e2e,stroke-width:2px
     class tsd,init root
     class pty hardened
     class vol store
 ```
 
-Red is root, green is the hardened session container, and the arrow from
+Red outline is root, teal is the hardened session container, and the arrow from
 `init-perms` is the ordering that makes the shared volume writable before the
 non-root container starts. `openab-pty` never listens off-loopback: it refuses
 to, while it holds no TLS key, so `tailscaled` sharing the namespace is the only
@@ -99,10 +99,10 @@ flowchart TB
     role -.->|"agent needs it"| agent
     role -.->|"but pty can reach<br/>the credential endpoint too"| pty
 
-    classDef root fill:#fde8e8,stroke:#c53030,color:#742a2a
-    classDef hardened fill:#e6fffa,stroke:#2c7a7b,color:#234e52
-    classDef store fill:#fffaf0,stroke:#b7791f,color:#744210
-    classDef warn fill:#fffff0,stroke:#d69e2e,color:#744210,stroke-dasharray: 4 3
+    classDef root fill:#e53e3e22,stroke:#e53e3e,stroke-width:2px
+    classDef hardened fill:#38b2ac22,stroke:#38b2ac,stroke-width:2px
+    classDef store fill:#d69e2e22,stroke:#d69e2e,stroke-width:2px
+    classDef warn fill:#ed893622,stroke:#ed8936,stroke-width:2px,stroke-dasharray: 4 3
     class init,tsd root
     class agent,pty hardened
     class vol store
