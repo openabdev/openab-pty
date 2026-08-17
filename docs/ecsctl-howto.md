@@ -17,12 +17,104 @@ A shell inside a locked-down container, reached over a WireGuard tailnet, with
 `kiro-cli` already on `PATH` because the image is built from the OAB agent image.
 No public port, no SSH key, no host access.
 
+```mermaid
+flowchart LR
+    subgraph laptop["Your machine"]
+        client["macOS client<br/><i>clients/macos</i>"]
+    end
+
+    subgraph tailnet["Tailnet · WireGuard"]
+        direction TB
+        ts_note["No public port.<br/>No inbound security-group rule."]
+    end
+
+    subgraph task["ECS Fargate task · awsvpc"]
+        direction TB
+
+        subgraph ns["shared network namespace"]
+            direction LR
+            tsd["<b>tailscale</b><br/>tailscaled --tun=userspace-networking<br/><i>user 0 · essential</i>"]
+            pty["<b>openab-pty</b><br/>binds 127.0.0.1:8090 only<br/><i>user 1000 · readonly rootfs · caps ALL dropped</i>"]
+            tsd -.->|"proxies to loopback"| pty
+        end
+
+        init["<b>init-perms</b><br/>chown 1000:1000, then exits 0<br/><i>user 0 · essential: false</i>"]
+        vol[("workspace<br/><i>task volume</i>")]
+
+        init ==>|"dependsOn: SUCCESS"| pty
+        init --- vol
+        pty --- vol
+    end
+
+    client -->|"WSS/HTTP over WireGuard<br/>Bearer credential"| tailnet
+    tailnet --> tsd
+
+    classDef root fill:#fde8e8,stroke:#c53030,color:#742a2a
+    classDef hardened fill:#e6fffa,stroke:#2c7a7b,color:#234e52
+    classDef store fill:#fffaf0,stroke:#b7791f,color:#744210
+    class tsd,init root
+    class pty hardened
+    class vol store
+```
+
+Red is root, green is the hardened session container, and the arrow from
+`init-perms` is the ordering that makes the shared volume writable before the
+non-root container starts. `openab-pty` never listens off-loopback: it refuses
+to, while it holds no TLS key, so `tailscaled` sharing the namespace is the only
+path in.
+
 Two shapes, both in [`deploy/ecs/`](../deploy/ecs/):
 
 | Manifest | Containers | Use for |
 |---|---|---|
-| [`pty-kiro.yaml`](../deploy/ecs/pty-kiro.yaml) | 3 | openab-pty on its own |
+| [`pty-kiro.yaml`](../deploy/ecs/pty-kiro.yaml) | 3 | openab-pty on its own — the diagram above |
 | [`kiro-with-pty.yaml`](../deploy/ecs/kiro-with-pty.yaml) | 4 | An agent **and** a terminal into the same `/workspace` — the adjacency case this runtime exists for |
+
+The four-container shape adds the agent to the same volume, which is the point
+and also the thing to understand before deploying it:
+
+```mermaid
+flowchart TB
+    subgraph task["ECS Fargate task"]
+        direction TB
+        init["<b>init-perms</b> · root · essential: false<br/>chown, exit 0"]
+
+        subgraph zone["one trust zone"]
+            direction LR
+            agent["<b>openab</b><br/>kiro-cli under the OAB broker<br/><i>user 1000</i>"]
+            pty["<b>openab-pty</b><br/>terminal into the same HOME<br/><i>user 1000 · readonly rootfs</i>"]
+        end
+
+        vol[("workspace<br/>HOME=/workspace")]
+        tsd["<b>tailscale</b> · root<br/>reachability"]
+
+        init ==>|"dependsOn: SUCCESS"| agent
+        init ==>|"dependsOn: SUCCESS"| pty
+        agent --- vol
+        pty --- vol
+        tsd -.->|"loopback"| pty
+    end
+
+    role[["task role<br/><i>task-wide, not per container</i>"]]
+    role -.->|"agent needs it"| agent
+    role -.->|"but pty can reach<br/>the credential endpoint too"| pty
+
+    classDef root fill:#fde8e8,stroke:#c53030,color:#742a2a
+    classDef hardened fill:#e6fffa,stroke:#2c7a7b,color:#234e52
+    classDef store fill:#fffaf0,stroke:#b7791f,color:#744210
+    classDef warn fill:#fffff0,stroke:#d69e2e,color:#744210,stroke-dasharray: 4 3
+    class init,tsd root
+    class agent,pty hardened
+    class vol store
+    class role warn
+```
+
+Two consequences worth reading twice. `/workspace` is **shared**, so a terminal
+session can read and write anything the agent can, and the reverse — one trust
+zone, by design. And an ECS task role is **task-wide**: the pty container is given
+no role of its own, but it can still reach the task credential endpoint. If
+either matters for your deployment, run the terminal in a separate task and share
+the workspace over EFS.
 
 Both need `ecsctl` **0.13.0 or later**. Earlier versions cannot express
 `dependsOn`, per-container `user`, `readonlyRootFilesystem`,
