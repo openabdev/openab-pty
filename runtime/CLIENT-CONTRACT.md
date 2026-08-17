@@ -138,7 +138,7 @@ Client → server control: `{"v":1,"type":"resize","cols":120,"rows":40}`,
 unknown types and out-of-range values count toward an abuse metric and
 disconnect after three.
 
-Server → client control: `gap` (with `dropped_bytes`, on ring-buffer overflow —
+Server → client control: `gap` (with `bytes_dropped`, on ring-buffer overflow —
 clear and redraw rather than rendering a sliced ANSI stream) and `ttl-warning`
 (precedes forced teardown).
 

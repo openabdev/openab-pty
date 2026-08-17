@@ -1087,7 +1087,7 @@ impl SessionManager {
             // be swept on its first tick, before anyone could attach: the
             // runtime silently stops working after 30 minutes of uptime.
             last_activity_ms: AtomicU64::new(
-                Instant::now().duration_since(self.epoch).as_millis() as u64,
+                Instant::now().duration_since(self.epoch).as_millis() as u64
             ),
             subscriber: Mutex::new(None),
             buffer: Mutex::new(RingBuffer::with_scrollback_kib(self.config.scrollback_kib)),
@@ -2740,7 +2740,9 @@ mod tests {
         // Age the manager past its own idle TTL before creating anything.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        let created = manager.create(name("fresh"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("fresh"), WindowSize::default())
+            .unwrap();
         assert!(
             manager.tick().await.is_empty(),
             "a just-created session must not be expired by a manager that has \
