@@ -1,20 +1,22 @@
 import AppKit
 import SwiftTerm
 
-/// A terminal window bound to one openab-pty session.
+/// The terminal for one session, as a pane rather than a window so it can live in
+/// the split view's detail area.
 ///
-/// Recovery is automatic and silent where it can be: on a rejected attach the
-/// client asks the admin API whether the session still exists, renews the token
-/// if it does, and only involves the user when the session is genuinely gone.
-/// That is the whole point of holding the credential locally.
-final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
+/// Recovery is deliberately silent where it can be: on a refused attach it asks
+/// the admin API whether the session still exists, renews the token if so, and
+/// only involves the user when the session is genuinely gone. Holding the
+/// credential locally is what makes that possible.
+final class TerminalPaneController: NSViewController, TerminalViewDelegate {
     private let profile: Profile
     private let api: ApiClient
-    private let sessionName: String
+    let sessionName: String
     private var token: String
+
     private var terminal: TerminalView!
-    private var connection: AttachConnection?
     private var banner: NSTextField!
+    private var connection: AttachConnection?
     private var reconnecting = false
 
     init(profile: Profile, api: ApiClient, sessionName: String, token: String) {
@@ -22,40 +24,46 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
         self.api = api
         self.sessionName = sessionName
         self.token = token
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 560),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered, defer: false)
-        window.title = "\(sessionName) — \(profile.name)"
-        super.init(window: window)
-
-        let container = NSView(frame: window.contentView!.bounds)
-        container.autoresizingMask = [.width, .height]
-
-        banner = NSTextField(labelWithString: "connecting…")
-        banner.font = .systemFont(ofSize: 11)
-        banner.textColor = .secondaryLabelColor
-        banner.frame = NSRect(x: 8, y: container.bounds.height - 20, width: container.bounds.width - 16, height: 16)
-        banner.autoresizingMask = [.width, .minYMargin]
-
-        terminal = TerminalView(frame: NSRect(x: 0, y: 0,
-                                              width: container.bounds.width,
-                                              height: container.bounds.height - 24))
-        terminal.autoresizingMask = [.width, .height]
-        terminal.terminalDelegate = self
-
-        container.addSubview(terminal)
-        container.addSubview(banner)
-        window.contentView = container
-        window.makeFirstResponder(terminal)
+        super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func start() {
-        connect(since: nil)
-        showWindow(nil)
+    override func loadView() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 520))
+
+        banner = NSTextField(labelWithString: "connecting…")
+        banner.font = .systemFont(ofSize: 11)
+        banner.textColor = .secondaryLabelColor
+        banner.translatesAutoresizingMaskIntoConstraints = false
+
+        terminal = TerminalView(frame: .zero)
+        terminal.translatesAutoresizingMaskIntoConstraints = false
+        terminal.terminalDelegate = self
+
+        container.addSubview(banner)
+        container.addSubview(terminal)
+        NSLayoutConstraint.activate([
+            banner.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            banner.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            banner.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            terminal.topAnchor.constraint(equalTo: banner.bottomAnchor, constant: 6),
+            terminal.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            terminal.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            terminal.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        view = container
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(terminal)
+        if connection == nil { connect(since: nil) }
+    }
+
+    func stop() {
+        connection?.disconnect()
+        connection = nil
     }
 
     private func setBanner(_ text: String, warning: Bool = false) {
@@ -68,9 +76,9 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
             guard let self else { return }
             switch event {
             case .notice(let offset, let ephemeral, let externalise, let bestEffort):
-                var parts = ["attached at offset \(offset)"]
+                var parts = ["\(self.sessionName) · offset \(offset)"]
                 if ephemeral { parts.append("workspace is ephemeral — \(externalise)") }
-                if bestEffort { parts.append("teardown is best-effort") }
+                if bestEffort { parts.append("teardown best-effort") }
                 self.setBanner(parts.joined(separator: " · "))
             case .bytes(let bytes):
                 self.terminal.feed(byteArray: bytes[...])
@@ -92,13 +100,13 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
         let offset = connection?.streamOffset
         connection = nil
 
-        // Never opened means the handshake itself was refused, which the runtime
-        // reports as 401 for BOTH an expired token and a missing session. Resolve
-        // it rather than telling the user something that might be false.
+        // Never opened => the handshake was refused, and the runtime answers 401
+        // for BOTH an expired token and a missing session. Resolve it instead of
+        // telling the user something that may well be false.
         if !everOpened {
             guard !reconnecting else { return }
             reconnecting = true
-            setBanner("connection refused — checking whether the session still exists…", warning: true)
+            setBanner("refused — checking whether the session still exists…", warning: true)
             Task { @MainActor in
                 defer { self.reconnecting = false }
                 do {
@@ -108,7 +116,8 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
                         self.setBanner("token had expired — renewed, reconnecting")
                         self.connect(since: offset)
                     case .sessionGone:
-                        self.offerRestart()
+                        self.setBanner("the shell exited; this session is gone. Create it again from the sidebar.",
+                                       warning: true)
                     }
                 } catch {
                     self.setBanner("could not recover: \(error.localizedDescription)", warning: true)
@@ -120,35 +129,13 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
         let (title, detail) = CloseReason.describe(code)
         setBanner("\(title) — \(detail)", warning: true)
 
-        // A rotated token is not an error: the shell is still there.
+        // A rotated token is not a failure: the shell survived it.
         if code == 4003 {
             Task { @MainActor in
                 if let grant = try? await self.api.renew(name: self.sessionName) {
                     self.token = grant.token
                     self.connect(since: offset)
                 }
-            }
-        }
-    }
-
-    private func offerRestart() {
-        let alert = NSAlert()
-        alert.messageText = "The session “\(sessionName)” is gone"
-        alert.informativeText = "Its shell exited, or it passed a TTL. Start a fresh one under the same name?"
-        alert.addButton(withTitle: "Restart")
-        alert.addButton(withTitle: "Close")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            window?.close()
-            return
-        }
-        Task { @MainActor in
-            do {
-                let grant = try await self.api.create(name: self.sessionName)
-                self.token = grant.token
-                self.terminal.feed(text: "\r\n[new session]\r\n")
-                self.connect(since: nil)
-            } catch {
-                self.setBanner("restart failed: \(error.localizedDescription)", warning: true)
             }
         }
     }
@@ -164,7 +151,7 @@ final class TerminalWindowController: NSWindowController, TerminalViewDelegate {
     }
 
     func setTerminalTitle(source: TerminalView, title: String) {
-        window?.title = title.isEmpty ? "\(sessionName) — \(profile.name)" : title
+        view.window?.title = title.isEmpty ? "openab-pty" : title
     }
 
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}

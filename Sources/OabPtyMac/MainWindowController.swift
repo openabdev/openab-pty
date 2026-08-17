@@ -1,223 +1,114 @@
 import AppKit
 
-/// Main window: manage connections, list sessions, open terminals.
-final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private var profiles: [Profile] = ProfileStore.load()
-    private var selectedProfile: Profile? { profilePopUp.indexOfSelectedItem >= 0 && profilePopUp.indexOfSelectedItem < profiles.count ? profiles[profilePopUp.indexOfSelectedItem] : nil }
-
-    private var profilePopUp: NSPopUpButton!
-    private var table: NSTableView!
+/// One window: agent connections on the left, the active terminal on the right.
+final class MainWindowController: NSWindowController, SidebarDelegate {
+    private let split = NSSplitViewController()
+    private let sidebar = SidebarViewController()
+    private let detail = NSViewController()
+    private var currentPane: TerminalPaneController?
+    private var placeholder: NSTextField!
     private var status: NSTextField!
-    private var sessions: [SessionInfo] = []
-    private var terminals: [TerminalWindowController] = []
 
     init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 420),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1060, height: 620),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
                               backing: .buffered, defer: false)
         window.title = "openab-pty"
+        window.minSize = NSSize(width: 760, height: 420)
         super.init(window: window)
-        buildUI()
-        refreshProfiles()
+
+        detail.view = NSView(frame: NSRect(x: 0, y: 0, width: 780, height: 620))
+        placeholder = NSTextField(labelWithString:
+            "Add an agent connection on the left, then double-click a session to attach.")
+        placeholder.textColor = .secondaryLabelColor
+        placeholder.translatesAutoresizingMaskIntoConstraints = false
+        detail.view.addSubview(placeholder)
+        NSLayoutConstraint.activate([
+            placeholder.centerXAnchor.constraint(equalTo: detail.view.centerXAnchor),
+            placeholder.centerYAnchor.constraint(equalTo: detail.view.centerYAnchor)
+        ])
+
+        sidebar.delegate = self
+
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
+        sidebarItem.minimumThickness = 220
+        sidebarItem.maximumThickness = 360
+        sidebarItem.canCollapse = true
+        let detailItem = NSSplitViewItem(viewController: detail)
+        detailItem.minimumThickness = 480
+        split.addSplitViewItem(sidebarItem)
+        split.addSplitViewItem(detailItem)
+
+        // Status line spans the bottom so a connection error is visible without
+        // opening anything.
+        status = NSTextField(labelWithString: "no connection yet")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView(frame: window.contentView!.bounds)
+        split.view.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(split.view)
+        root.addSubview(status)
+        NSLayoutConstraint.activate([
+            split.view.topAnchor.constraint(equalTo: root.topAnchor),
+            split.view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            split.view.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            split.view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -4),
+            status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8)
+        ])
+        window.contentView = root
+        contentViewController = nil
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    private func buildUI() {
-        let content = NSView(frame: window!.contentView!.bounds)
-        content.autoresizingMask = [.width, .height]
+    // MARK: SidebarDelegate
 
-        profilePopUp = NSPopUpButton(frame: NSRect(x: 12, y: 380, width: 260, height: 25))
-        profilePopUp.target = self
-        profilePopUp.action = #selector(profileChanged)
-
-        let addButton = NSButton(title: "Add connection…", target: self, action: #selector(addConnection))
-        addButton.frame = NSRect(x: 280, y: 379, width: 150, height: 26)
-
-        let refreshButton = NSButton(title: "Refresh", target: self, action: #selector(refreshSessions))
-        refreshButton.frame = NSRect(x: 436, y: 379, width: 80, height: 26)
-
-        let newButton = NSButton(title: "New session…", target: self, action: #selector(newSession))
-        newButton.frame = NSRect(x: 520, y: 379, width: 88, height: 26)
-
-        let scroll = NSScrollView(frame: NSRect(x: 12, y: 40, width: 596, height: 330))
-        scroll.autoresizingMask = [.width, .height]
-        scroll.hasVerticalScroller = true
-        table = NSTableView(frame: scroll.bounds)
-        for (id, title, width) in [("name", "Session", 160), ("state", "State", 150),
-                                   ("tier", "Kill domain", 180), ("bytes", "Output", 80)] {
-            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
-            col.title = title
-            col.width = CGFloat(width)
-            table.addTableColumn(col)
-        }
-        table.dataSource = self
-        table.delegate = self
-        table.doubleAction = #selector(openSelected)
-        table.target = self
-        scroll.documentView = table
-
-        status = NSTextField(labelWithString: "no connection selected")
-        status.font = .systemFont(ofSize: 11)
-        status.textColor = .secondaryLabelColor
-        status.frame = NSRect(x: 12, y: 12, width: 596, height: 18)
-        status.autoresizingMask = [.width, .maxYMargin]
-
-        for v in [profilePopUp, addButton, refreshButton, newButton, scroll, status] as [NSView] {
-            content.addSubview(v)
-        }
-        window?.contentView = content
+    func sidebar(_ sidebar: SidebarViewController, didReportStatus text: String) {
+        status.stringValue = text
     }
 
-    private func refreshProfiles() {
-        profilePopUp.removeAllItems()
-        for p in profiles { profilePopUp.addItem(withTitle: "\(p.name) — \(p.baseURL)") }
-        if !profiles.isEmpty { profilePopUp.selectItem(at: 0); refreshSessions() }
-    }
-
-    private func client() -> ApiClient? {
-        guard let profile = selectedProfile,
-              let credential = Keychain.credential(for: profile.name) else { return nil }
-        return ApiClient(profile: profile, credential: credential)
-    }
-
-    @objc private func profileChanged() { refreshSessions() }
-
-    @objc private func addConnection() {
-        let alert = NSAlert()
-        alert.messageText = "Add an openab-pty connection"
-        alert.informativeText = "The admin credential is stored in your Keychain. It is what lets this app renew its own attach tokens instead of asking someone for a new one every time."
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-
-        let form = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 90))
-        let nameField = NSTextField(frame: NSRect(x: 0, y: 62, width: 380, height: 24))
-        nameField.placeholderString = "name (e.g. p1)"
-        let urlField = NSTextField(frame: NSRect(x: 0, y: 32, width: 380, height: 24))
-        urlField.placeholderString = "base URL (e.g. http://192.168.0.25:8090)"
-        let credField = NSSecureTextField(frame: NSRect(x: 0, y: 2, width: 380, height: 24))
-        credField.placeholderString = "admin credential"
-        form.addSubview(nameField); form.addSubview(urlField); form.addSubview(credField)
-        alert.accessoryView = form
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
-        let url = urlField.stringValue.trimmingCharacters(in: .whitespaces)
-        let cred = credField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !url.isEmpty, !cred.isEmpty else {
-            status.stringValue = "all three fields are required"
+    func sidebar(_ sidebar: SidebarViewController, didChoose session: SessionNode) {
+        guard let api = sidebar.apiClient(for: session.connection) else {
+            status.stringValue = "credential for \(session.connection.profile.name) is missing from the Keychain"
             return
         }
-        do {
-            try Keychain.save(credential: cred, for: name)
-        } catch {
-            status.stringValue = error.localizedDescription
-            return
-        }
-        profiles.removeAll { $0.name == name }
-        profiles.append(Profile(baseURL: url, name: name))
-        ProfileStore.save(profiles)
-        refreshProfiles()
-    }
-
-    @objc private func refreshSessions() {
-        guard let api = client(), let profile = selectedProfile else {
-            status.stringValue = "no connection selected (or its credential is missing from the Keychain)"
-            sessions = []; table.reloadData(); return
-        }
-        status.stringValue = "querying \(profile.baseURL)…"
+        let name = session.info.name
+        let profile = session.connection.profile
+        status.stringValue = "attaching to \(name)…"
         Task { @MainActor in
             do {
-                let listing = try await api.list()
-                self.sessions = listing.sessions
-                self.table.reloadData()
-                // Report best-effort semantics rather than implying a guarantee
-                // the runtime explicitly does not make.
-                var parts = ["\(listing.sessions.count) session(s)", listing.killDomain.tier]
-                if listing.killDomain.teardownBestEffort { parts.append("teardown best-effort") }
-                if listing.killDomain.leakedProcesses > 0 {
-                    parts.append("⚠︎ \(listing.killDomain.leakedProcesses) leaked process(es)")
-                }
-                if listing.draining { parts.append("runtime is draining") }
-                self.status.stringValue = parts.joined(separator: " · ")
-            } catch {
-                self.sessions = []; self.table.reloadData()
-                self.status.stringValue = error.localizedDescription
-            }
-        }
-    }
-
-    @objc private func newSession() {
-        guard let api = client() else { status.stringValue = "no connection selected"; return }
-        let alert = NSAlert()
-        alert.messageText = "New session"
-        alert.informativeText = "Names must match [a-z0-9-] and be at most 32 characters."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = "mac"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Create")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
-        // Validate before the round trip: the runtime's own rule, applied here so
-        // the user sees the problem immediately.
-        guard !name.isEmpty, name.count <= 32,
-              name.allSatisfy({ $0.isLowercase && $0.isLetter || $0.isNumber || $0 == "-" }) else {
-            status.stringValue = "invalid name: expected [a-z0-9-]{1,32}"
-            return
-        }
-        Task { @MainActor in
-            do {
-                let grant = try await api.create(name: name)
-                self.openTerminal(name: name, token: grant.token)
-                self.refreshSessions()
-            } catch {
-                self.status.stringValue = error.localizedDescription
-            }
-        }
-    }
-
-    @objc private func openSelected() {
-        let row = table.selectedRow
-        guard row >= 0, row < sessions.count, let api = client() else { return }
-        let name = sessions[row].name
-        Task { @MainActor in
-            do {
-                // Mint a token for this attach rather than reusing one we may not
-                // have: renew keeps the shell and its scrollback.
+                // Renew rather than reuse: the shell and its scrollback survive,
+                // and we get a token whose lifetime we know.
                 let grant = try await api.renew(name: name)
-                self.openTerminal(name: name, token: grant.token)
+                self.showPane(profile: profile, api: api, name: name, token: grant.token)
             } catch {
                 self.status.stringValue = error.localizedDescription
             }
         }
     }
 
-    private func openTerminal(name: String, token: String) {
-        guard let profile = selectedProfile, let api = client() else { return }
-        let controller = TerminalWindowController(profile: profile, api: api,
-                                                  sessionName: name, token: token)
-        terminals.append(controller)
-        controller.start()
-    }
+    private func showPane(profile: Profile, api: ApiClient, name: String, token: String) {
+        currentPane?.stop()
+        currentPane?.view.removeFromSuperview()
+        currentPane?.removeFromParent()
+        placeholder.isHidden = true
 
-    // MARK: table
-
-    func numberOfRows(in tableView: NSTableView) -> Int { sessions.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let s = sessions[row]
-        let text: String
-        switch tableColumn?.identifier.rawValue {
-        case "name": text = s.name
-        case "state": text = s.alive ? (s.attached ? "attached" : "detached (alive)") : "dead"
-        case "tier": text = s.teardownBestEffort ? "\(s.tier) (best-effort)" : s.tier
-        case "bytes": text = "\(s.bytesWritten)"
-        default: text = ""
-        }
-        let field = NSTextField(labelWithString: text)
-        field.font = .systemFont(ofSize: 12)
-        return field
+        let pane = TerminalPaneController(profile: profile, api: api, sessionName: name, token: token)
+        detail.addChild(pane)
+        pane.view.translatesAutoresizingMaskIntoConstraints = false
+        detail.view.addSubview(pane.view)
+        NSLayoutConstraint.activate([
+            pane.view.topAnchor.constraint(equalTo: detail.view.topAnchor),
+            pane.view.leadingAnchor.constraint(equalTo: detail.view.leadingAnchor),
+            pane.view.trailingAnchor.constraint(equalTo: detail.view.trailingAnchor),
+            pane.view.bottomAnchor.constraint(equalTo: detail.view.bottomAnchor)
+        ])
+        currentPane = pane
+        pane.viewDidAppear()
+        status.stringValue = "attached to \(name) on \(profile.name)"
     }
 }

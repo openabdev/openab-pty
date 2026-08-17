@@ -1,0 +1,274 @@
+import AppKit
+
+/// Outline nodes. `NSOutlineView` needs object identity, and `Profile` /
+/// `SessionInfo` are value types, so they are wrapped rather than used directly.
+final class ConnectionNode {
+    let profile: Profile
+    var sessions: [SessionNode] = []
+    var statusLine: String = "not loaded"
+    init(profile: Profile) { self.profile = profile }
+}
+
+final class SessionNode {
+    let info: SessionInfo
+    unowned let connection: ConnectionNode
+    init(info: SessionInfo, connection: ConnectionNode) {
+        self.info = info
+        self.connection = connection
+    }
+}
+
+protocol SidebarDelegate: AnyObject {
+    func sidebar(_ sidebar: SidebarViewController, didChoose session: SessionNode)
+    func sidebar(_ sidebar: SidebarViewController, didReportStatus text: String)
+}
+
+/// Left pane: agent connections, each expanding to its live sessions.
+final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    weak var delegate: SidebarDelegate?
+    private var nodes: [ConnectionNode] = []
+    private var outline: NSOutlineView!
+
+    override func loadView() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 520))
+
+        let addButton = NSButton(title: "＋ Connection", target: self, action: #selector(addConnection))
+        addButton.bezelStyle = .rounded
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let newSessionButton = NSButton(title: "＋ Session", target: self, action: #selector(newSession))
+        newSessionButton.bezelStyle = .rounded
+        newSessionButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let refreshButton = NSButton(title: "↻", target: self, action: #selector(refresh))
+        refreshButton.bezelStyle = .rounded
+        refreshButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+
+        outline = NSOutlineView()
+        outline.headerView = nil
+        outline.rowSizeStyle = .default
+        outline.indentationPerLevel = 14
+        outline.dataSource = self
+        outline.delegate = self
+        outline.target = self
+        outline.doubleAction = #selector(openSelected)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
+        column.width = 230
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+        scroll.documentView = outline
+
+        container.addSubview(addButton)
+        container.addSubview(newSessionButton)
+        container.addSubview(refreshButton)
+        container.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            addButton.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            addButton.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            newSessionButton.topAnchor.constraint(equalTo: addButton.topAnchor),
+            newSessionButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 6),
+            refreshButton.topAnchor.constraint(equalTo: addButton.topAnchor),
+            refreshButton.leadingAnchor.constraint(equalTo: newSessionButton.trailingAnchor, constant: 6),
+            refreshButton.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
+            scroll.topAnchor.constraint(equalTo: addButton.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        view = container
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        nodes = ProfileStore.load().map(ConnectionNode.init)
+        outline.reloadData()
+        refresh()
+    }
+
+    private func client(for node: ConnectionNode) -> ApiClient? {
+        guard let credential = Keychain.credential(for: node.profile.name) else { return nil }
+        return ApiClient(profile: node.profile, credential: credential)
+    }
+
+    private func selectedConnection() -> ConnectionNode? {
+        let row = outline.selectedRow
+        guard row >= 0, let item = outline.item(atRow: row) else { return nodes.first }
+        if let c = item as? ConnectionNode { return c }
+        if let s = item as? SessionNode { return s.connection }
+        return nodes.first
+    }
+
+    // MARK: actions
+
+    @objc func refresh() {
+        for node in nodes {
+            guard let api = client(for: node) else {
+                node.statusLine = "credential missing from Keychain"
+                continue
+            }
+            Task { @MainActor in
+                do {
+                    let listing = try await api.list()
+                    node.sessions = listing.sessions.map { SessionNode(info: $0, connection: node) }
+                    // Report best-effort semantics rather than implying a
+                    // guarantee the runtime explicitly does not make.
+                    var parts = [listing.killDomain.tier]
+                    if listing.killDomain.teardownBestEffort { parts.append("best-effort") }
+                    if listing.killDomain.leakedProcesses > 0 {
+                        parts.append("⚠︎ \(listing.killDomain.leakedProcesses) leaked")
+                    }
+                    if listing.draining { parts.append("draining") }
+                    node.statusLine = parts.joined(separator: " · ")
+                    self.outline.reloadData()
+                    self.outline.expandItem(node)
+                    self.delegate?.sidebar(self, didReportStatus:
+                        "\(node.profile.name): \(listing.sessions.count) session(s) · \(node.statusLine)")
+                } catch {
+                    node.statusLine = error.localizedDescription
+                    node.sessions = []
+                    self.outline.reloadData()
+                    self.delegate?.sidebar(self, didReportStatus: "\(node.profile.name): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    @objc private func addConnection() {
+        let alert = NSAlert()
+        alert.messageText = "Add an agent connection"
+        alert.informativeText = "The admin credential is kept in your Keychain. It is what lets this app renew its own attach tokens, instead of needing a new one handed to it every few minutes."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 92))
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 64, width: 380, height: 24))
+        nameField.placeholderString = "name (e.g. p1)"
+        let urlField = NSTextField(frame: NSRect(x: 0, y: 34, width: 380, height: 24))
+        urlField.placeholderString = "base URL (e.g. http://192.168.0.25:8090)"
+        let credField = NSSecureTextField(frame: NSRect(x: 0, y: 4, width: 380, height: 24))
+        credField.placeholderString = "admin credential"
+        form.addSubview(nameField); form.addSubview(urlField); form.addSubview(credField)
+        alert.accessoryView = form
+        alert.window.initialFirstResponder = nameField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        let url = urlField.stringValue.trimmingCharacters(in: .whitespaces)
+        let cred = credField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !url.isEmpty, !cred.isEmpty else {
+            delegate?.sidebar(self, didReportStatus: "all three fields are required")
+            return
+        }
+        do { try Keychain.save(credential: cred, for: name) } catch {
+            delegate?.sidebar(self, didReportStatus: error.localizedDescription)
+            return
+        }
+        var profiles = ProfileStore.load()
+        profiles.removeAll { $0.name == name }
+        profiles.append(Profile(baseURL: url, name: name))
+        ProfileStore.save(profiles)
+        nodes = profiles.map(ConnectionNode.init)
+        outline.reloadData()
+        refresh()
+    }
+
+    @objc private func newSession() {
+        guard let node = selectedConnection(), let api = client(for: node) else {
+            delegate?.sidebar(self, didReportStatus: "select a connection first")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "New session on \(node.profile.name)"
+        alert.informativeText = "Names must match [a-z0-9-] and be at most 32 characters."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = "mac"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        // The runtime's own rule, applied here so the user sees it without a
+        // round trip.
+        let allowed = name.allSatisfy { ($0.isLetter && $0.isLowercase) || $0.isNumber || $0 == "-" }
+        guard !name.isEmpty, name.count <= 32, allowed else {
+            delegate?.sidebar(self, didReportStatus: "invalid name: expected [a-z0-9-]{1,32}")
+            return
+        }
+        Task { @MainActor in
+            do {
+                let grant = try await api.create(name: name)
+                let fresh = SessionInfo(name: name, generation: grant.generation, alive: true,
+                                        attached: false, bytesWritten: 0,
+                                        tier: node.statusLine, teardownBestEffort: true)
+                let sessionNode = SessionNode(info: fresh, connection: node)
+                node.sessions.append(sessionNode)
+                self.outline.reloadData()
+                self.outline.expandItem(node)
+                self.delegate?.sidebar(self, didChoose: sessionNode)
+                self.refresh()
+            } catch {
+                self.delegate?.sidebar(self, didReportStatus: error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func openSelected() {
+        let row = outline.selectedRow
+        guard row >= 0, let node = outline.item(atRow: row) as? SessionNode else { return }
+        delegate?.sidebar(self, didChoose: node)
+    }
+
+    func apiClient(for node: ConnectionNode) -> ApiClient? { client(for: node) }
+
+    // MARK: outline data
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        if item == nil { return nodes.count }
+        if let c = item as? ConnectionNode { return c.sessions.count }
+        return 0
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        if item == nil { return nodes[index] }
+        return (item as! ConnectionNode).sessions[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        (item as? ConnectionNode) != nil
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        let text: String
+        let secondary: String
+        if let c = item as? ConnectionNode {
+            text = c.profile.name
+            secondary = c.profile.baseURL
+        } else if let s = item as? SessionNode {
+            text = s.info.name
+            secondary = s.info.alive ? (s.info.attached ? "attached" : "detached · alive") : "dead"
+        } else {
+            return nil
+        }
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        let title = NSTextField(labelWithString: text)
+        title.font = (item is ConnectionNode) ? .systemFont(ofSize: 12, weight: .semibold)
+                                              : .systemFont(ofSize: 12)
+        let sub = NSTextField(labelWithString: secondary)
+        sub.font = .systemFont(ofSize: 10)
+        sub.textColor = .secondaryLabelColor
+        stack.addView(title, in: .leading)
+        stack.addView(sub, in: .leading)
+        return stack
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat { 34 }
+}
