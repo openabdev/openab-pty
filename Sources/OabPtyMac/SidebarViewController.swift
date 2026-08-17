@@ -395,6 +395,31 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         }
     }
 
+    @objc private func menuLabel() {
+        guard let s = contextItem() as? SessionNode else { return }
+        let profile = s.connection.profile.name
+        let name = s.info.name
+        let current = SessionLabels.label(profile: profile, session: name) ?? ""
+
+        let alert = NSAlert()
+        alert.messageText = "Label for the session " + name
+        alert.informativeText = "This is a local label only. The session keeps the name " + name
+            + " on the host, because that name is its identity: it is in the attach URL, in every "
+            + "token issued for it, and in the audit log. Leave it empty to clear the label."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.stringValue = current
+        field.placeholderString = "e.g. project-x agent"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        SessionLabels.set(field.stringValue.trimmingCharacters(in: .whitespaces),
+                          profile: profile, session: name)
+        outline.reloadData()
+    }
+
     @objc private func menuTerminate() {
         guard let s = contextItem() as? SessionNode, let api = client(for: s.connection) else { return }
         let name = s.info.name
@@ -456,8 +481,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             lamp = c.health.lamp
             lampColour = c.health.colour
         } else if let s = item as? SessionNode {
-            text = s.info.name
-            secondary = s.info.alive ? (s.info.attached ? "attached" : "detached · alive") : "dead"
+            let label = SessionLabels.label(profile: s.connection.profile.name, session: s.info.name)
+            let state = s.info.alive ? (s.info.attached ? "attached" : "detached · alive") : "dead"
+            // The label leads, but the real name is always present: it is what the
+            // audit log, the attach URL and every token actually refer to.
+            text = label ?? s.info.name
+            secondary = label == nil ? state : s.info.name + " · " + state
             // A session lamp tracks the session, not the host: green while a
             // client holds it, amber when it is alive but nobody is attached,
             // red once the shell is gone.
@@ -514,6 +543,8 @@ extension SidebarViewController: NSMenuDelegate {
             }
             menu.addItem(withTitle: "Restart with a fresh shell", action: #selector(menuRestart), keyEquivalent: "")
             menu.addItem(withTitle: "Renew token (evicts current client)", action: #selector(menuRenew), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Set label...", action: #selector(menuLabel), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: session.info.alive ? "Terminate..." : "Terminate",
                          action: #selector(menuTerminate), keyEquivalent: "")
