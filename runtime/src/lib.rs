@@ -29,6 +29,7 @@ pub mod config;
 pub mod containment;
 pub mod killdomain;
 pub mod ringbuf;
+pub mod seed;
 pub mod server;
 pub mod session;
 pub mod termfilter;

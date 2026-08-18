@@ -1,0 +1,116 @@
+name: vendor drift
+
+# The extraction layer in runtime/src/seed.rs is copied from openabdev/openab, not
+# depended on. That trade was made deliberately (see the module header), but it has
+# one failure mode worth engineering against: a fix lands upstream — a path-traversal
+# hole, a budget bypass — and never arrives here, silently, because nothing is
+# watching. This job makes that divergence a notification.
+#
+# It compares a hash of the whole upstream file rather than trying to extract "the
+# corresponding region", because upstream has no markers to anchor on and a
+# region-matching heuristic would break the first time upstream reorders a function
+# — failing open, which is the wrong direction for this check. Hashing the whole file
+# means some alerts will be about the S3 orchestration we did not vendor. That noise
+# is the price of never missing the ones that matter, and reviewing a diff is cheap.
+
+on:
+  schedule:
+    # Weekly. The upstream file has changed once since June; daily would be noise.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Compare upstream against the recorded hash
+        id: check
+        run: |
+          set -uo pipefail
+          UPSTREAM_URL="https://raw.githubusercontent.com/openabdev/openab/main/crates/openab-core/src/pre_seed.rs"
+
+          # The hash recorded in the vendored file's header is the source of truth,
+          # so there is no second place to forget to update.
+          RECORDED=$(grep -oE 'upstream file sha256: `[0-9a-f]{64}`' runtime/src/seed.rs \
+                     | grep -oE '[0-9a-f]{64}' | head -1)
+          if [ -z "$RECORDED" ]; then
+            echo "::error::No recorded upstream sha256 found in runtime/src/seed.rs."
+            exit 1
+          fi
+
+          if ! curl -fsSL "$UPSTREAM_URL" -o /tmp/upstream.rs; then
+            # A fetch failure is not drift. Failing the job here would train people
+            # to ignore it; say so and stop.
+            echo "::warning::Could not fetch upstream; skipping this run."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(sha256sum /tmp/upstream.rs | cut -d' ' -f1)
+          echo "recorded=$RECORDED" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT"  >> "$GITHUB_OUTPUT"
+
+          if [ "$RECORDED" = "$CURRENT" ]; then
+            echo "status=unchanged" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged ($CURRENT)."
+          else
+            echo "status=drifted" >> "$GITHUB_OUTPUT"
+            echo "Upstream moved: $RECORDED -> $CURRENT"
+          fi
+
+      - name: Open an issue when upstream has moved
+        if: steps.check.outputs.status == 'drifted'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECORDED: ${{ steps.check.outputs.recorded }}
+          CURRENT: ${{ steps.check.outputs.current }}
+        run: |
+          set -euo pipefail
+          TITLE="Vendored seed extraction has drifted from upstream"
+
+          # One open issue at a time. A weekly job that opens a fresh issue every
+          # week produces a pile nobody reads.
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                       --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #$EXISTING is already open; adding nothing."
+            exit 0
+          fi
+
+          # Written to a file rather than piped through a heredoc inside this block
+          # scalar: getting the terminator's indentation wrong there produces a
+          # workflow that does not parse, which is a silent way to lose the check.
+          {
+            echo "\`crates/openab-core/src/pre_seed.rs\` in \`openabdev/openab\` has changed"
+            echo "since the extraction layer in \`runtime/src/seed.rs\` was vendored from it."
+            echo
+            echo "    recorded  $RECORDED"
+            echo "    upstream  $CURRENT"
+            echo
+            echo "This is not automatically a problem. The hash covers the whole upstream"
+            echo "file, including the S3 orchestration that was deliberately **not**"
+            echo "vendored, so many changes will be irrelevant here."
+            echo
+            echo "## What to do"
+            echo
+            echo "1. Diff the two and decide whether the change touches the extraction"
+            echo "   layer: \`extract_and_apply\`, the tarball path, \`symlink_escapes\`,"
+            echo "   \`normalize_path\`, \`create_symlink\`, \`move_recursive\`, or the budget"
+            echo "   constants."
+            echo "2. If it does, port it, keeping the deviations listed in the module header."
+            echo "3. Update \`upstream commit\` and \`upstream file sha256\` in that header"
+            echo "   either way, so the next run compares against a reviewed baseline"
+            echo "   rather than re-reporting the same drift."
+            echo
+            echo "Treat a change to path traversal, link handling, or the extraction"
+            echo "budgets as security-relevant and port it promptly. That case is the"
+            echo "entire reason this check exists."
+          } > /tmp/body.md
+
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file /tmp/body.md
