@@ -45,6 +45,7 @@
 //! arbitrary source list, credentials from the task role, and failures reported
 //! through the existing startup sequence.
 
+use anyhow::Context;
 use std::path::Path;
 use std::time::Instant;
 use tracing::warn;
@@ -308,6 +309,94 @@ fn move_recursive(src: &Path, dst: &Path, deadline: Instant) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Below here is not vendored. Everything above comes from OpenAB; this part is
+// specific to how this runtime seeds a workspace.
+// ===========================================================================
+
+/// What a seed run applied, for the startup log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Seeded {
+    /// Archive file names, in the order they were applied.
+    pub archives: Vec<String>,
+    pub bytes: u64,
+}
+
+/// Apply every `*.tar.gz` in `dir` into `target`, in lexicographic order.
+///
+/// The runtime deliberately knows nothing about S3, buckets, or which prefix an
+/// archive came from. Something else — an init container with credentials — decides
+/// which objects to fetch and what to call them; this only applies what it finds,
+/// safely, in a defined order. That split is why no AWS SDK is linked here: the
+/// hard part is turning an untrusted archive into files, and that is what the
+/// vendored code above does.
+///
+/// Order is lexicographic by file name, so the fetcher expresses layering by naming
+/// (`00-shared.tar.gz`, `10-agent.tar.gz`) rather than by this function having
+/// opinions about what a layer means. Later archives overwrite earlier ones.
+///
+/// ## Failure policy
+///
+/// Nothing to seed is success: an absent directory or one with no archives is the
+/// normal first boot, and refusing to start would make a fresh deployment fail for
+/// having no history.
+///
+/// An archive that is present but will not apply is a hard failure. Continuing would
+/// start an agent whose steering files, skills and instructions are silently absent
+/// or half-written — it would look healthy and behave like a different agent. That
+/// is worse than not starting, so this returns an error and the caller refuses to
+/// serve.
+pub fn apply_dir(dir: &Path, target: &Path, budget: std::time::Duration) -> anyhow::Result<Seeded> {
+    let mut applied = Seeded::default();
+
+    if !dir.exists() {
+        tracing::info!(dir = %dir.display(), "seed: no seed directory; nothing to apply");
+        return Ok(applied);
+    }
+
+    // Collected and sorted rather than streamed: read_dir order is filesystem
+    // order, and "later archive wins" is meaningless if the order is arbitrary.
+    let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("seed: cannot read {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.to_string_lossy().ends_with(".tar.gz"))
+        .collect();
+    archives.sort();
+
+    if archives.is_empty() {
+        tracing::info!(dir = %dir.display(), "seed: no archives to apply");
+        return Ok(applied);
+    }
+
+    // One budget across the whole run, not per archive: the point is a bound on how
+    // long startup can be delayed, and per-archive deadlines multiply by the number
+    // of files an attacker or a mistake can put in the directory.
+    let deadline = Instant::now() + budget;
+
+    for path in archives {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let data =
+            std::fs::read(&path).with_context(|| format!("seed: cannot read archive {name}"))?;
+
+        extract_and_apply(&data, target, deadline)
+            .with_context(|| format!("seed: applying {name} failed"))?;
+
+        applied.bytes += data.len() as u64;
+        applied.archives.push(name);
+    }
+
+    tracing::info!(
+        archives = ?applied.archives,
+        bytes = applied.bytes,
+        target = %target.display(),
+        "seed: applied"
+    );
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -882,5 +971,130 @@ mod tests {
             dir.path().join("evil_link").symlink_metadata().is_err(),
             "escaping hard link should never be written to disk"
         );
+    }
+    // --- apply_dir: this runtime's own layer, not vendored -----------------
+
+    fn budget() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    #[test]
+    fn apply_dir_missing_directory_is_not_an_error() {
+        // First boot with nothing saved yet. Refusing to start here would make a
+        // fresh deployment fail for having no history.
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("workspace");
+        let applied = apply_dir(&base.path().join("absent"), &target, budget()).unwrap();
+        assert_eq!(applied, Seeded::default());
+    }
+
+    #[test]
+    fn apply_dir_empty_directory_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let applied = apply_dir(dir.path(), target.path(), budget()).unwrap();
+        assert!(applied.archives.is_empty());
+        assert_eq!(applied.bytes, 0);
+    }
+
+    #[test]
+    fn apply_dir_applies_in_lexicographic_order_so_later_wins() {
+        // The whole layering contract: the fetcher names archives to express order,
+        // and this asserts the order is by name rather than readdir order.
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        // Written in reverse so filesystem order cannot accidentally be correct.
+        std::fs::write(
+            dir.path().join("10-agent.tar.gz"),
+            tgz(&[("steering.md", b"agent"), ("only-in-agent.md", b"x")]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("00-shared.tar.gz"),
+            tgz(&[("steering.md", b"shared"), ("only-in-shared.md", b"y")]),
+        )
+        .unwrap();
+
+        let applied = apply_dir(dir.path(), target.path(), budget()).unwrap();
+        assert_eq!(
+            applied.archives,
+            vec!["00-shared.tar.gz", "10-agent.tar.gz"]
+        );
+
+        // The agent layer wins on the contested path, and both layers' own files survive.
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("steering.md")).unwrap(),
+            "agent"
+        );
+        assert!(target.path().join("only-in-shared.md").exists());
+        assert!(target.path().join("only-in-agent.md").exists());
+    }
+
+    #[test]
+    fn apply_dir_ignores_files_that_are_not_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"ignored").unwrap();
+        std::fs::write(dir.path().join("archive.tar"), b"also ignored").unwrap();
+        std::fs::write(dir.path().join("ok.tar.gz"), tgz(&[("a.md", b"a")])).unwrap();
+
+        let applied = apply_dir(dir.path(), target.path(), budget()).unwrap();
+        assert_eq!(applied.archives, vec!["ok.tar.gz"]);
+        assert!(!target.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn apply_dir_fails_closed_on_a_corrupt_archive() {
+        // The policy that matters. Continuing would start an agent whose steering
+        // files are silently absent -- healthy-looking, and behaving like something
+        // else entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("00-broken.tar.gz"),
+            b"this is not a tarball",
+        )
+        .unwrap();
+
+        let err = apply_dir(dir.path(), target.path(), budget()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("00-broken.tar.gz"),
+            "error should name the archive: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_dir_rejects_an_archive_that_is_not_gzip() {
+        // A plain (uncompressed) tar has no gzip magic. Upstream would have tried it
+        // as a zip; this build rejects it, so the message should say so rather than
+        // fail somewhere deeper.
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        builder.append_data(&mut header, "a.md", &b"a"[..]).unwrap();
+        std::fs::write(
+            dir.path().join("00-plain.tar.gz"),
+            builder.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let err = apply_dir(dir.path(), target.path(), budget()).unwrap_err();
+        assert!(format!("{err:#}").contains("magic bytes"));
+    }
+
+    #[test]
+    fn apply_dir_respects_the_startup_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("00-a.tar.gz"), tgz(&[("a.md", b"a")])).unwrap();
+
+        // Zero budget: the deadline has passed before the first archive is read.
+        let err = apply_dir(dir.path(), target.path(), std::time::Duration::ZERO).unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"));
     }
 }

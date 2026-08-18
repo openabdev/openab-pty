@@ -63,6 +63,12 @@ pub struct PtyConfig {
     /// Literal `sha256:<64 lowercase hex>`; retained as a verifier, never a credential.
     pub admin_credential_hash: String,
     pub kill_domain_requirement: KillDomainRequirement,
+    /// Directory of `*.tar.gz` archives to apply into `$HOME` before serving.
+    ///
+    /// Empty means no seeding, which is the default and what every deployment did
+    /// before this existed. The runtime does not fetch these: something with
+    /// credentials puts them there, and this only applies them. See `crate::seed`.
+    pub seed_dir: String,
 }
 
 const PTY_KEYS: &[&str] = &[
@@ -78,6 +84,7 @@ const PTY_KEYS: &[&str] = &[
     "scrollback_replay",
     "admin_credential_hash",
     "kill_domain_tier",
+    "seed_dir",
 ];
 
 /// Parse and fail-closed validate a delivered PTY projection.
@@ -142,6 +149,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         scrollback_kib: usize_with_default(pty, "scrollback_kib", 1024)?,
         scrollback_replay: bool_with_default(pty, "scrollback_replay", false)?,
         admin_credential_hash: raw_hash,
+        seed_dir: string_with_default(pty, "seed_dir", "")?.to_string(),
         kill_domain_requirement: parse_kill_domain(string_with_default(
             pty,
             "kill_domain_tier",

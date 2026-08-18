@@ -34,6 +34,7 @@ attach_token_ttl = "${PTY_TOKEN_TTL}"
 scrollback_kib = ${PTY_SCROLLBACK_KIB}
 scrollback_replay = false
 admin_credential_hash = "${PTY_ADMIN_HASH}"
+seed_dir = "${PTY_SEED_DIR:-}"
 EOF
 
 # Fail before serving rather than after: the same validator the runtime applies

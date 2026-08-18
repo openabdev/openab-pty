@@ -96,6 +96,10 @@ ENV HOME=/workspace \
     PTY_ABSOLUTE_TTL=12h \
     PTY_IDLE_TTL=8h \
     PTY_TOKEN_TTL=12h \
-    PTY_SCROLLBACK_KIB=1024
+    PTY_SCROLLBACK_KIB=1024 \
+    # Empty means no seeding, which is what every deployment did before this
+    # existed. A deployment opts in by pointing this at a directory another
+    # container has filled with *.tar.gz; this image fetches nothing itself.
+    PTY_SEED_DIR=""
 
 ENTRYPOINT ["/usr/local/bin/openab-pty-entrypoint"]

@@ -15,7 +15,8 @@
 //! 3. Kill-domain tier selection, logging the active tier and what it does not
 //!    promise. An operator who required Tier 2 is refused here: it is not
 //!    implemented, and best effort must never be served under a guarantee's name.
-//! 4. Bind, behind the fail-closed listener guard.
+//! 4. Seeded state, applied into $HOME before anything can observe the workspace.
+//! 5. Bind, behind the fail-closed listener guard.
 //!
 //! Graceful shutdown runs the same order in reverse: notice → grace →
 //! `close_code::RUNTIME_REPLACED` → session teardown.
@@ -189,6 +190,30 @@ async fn run(projection: PtyConfig) -> Result<()> {
     let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
 
     let spawner = Arc::new(PortablePtySpawner);
+    // Seed before any session machinery exists, not merely before binding. /workspace is one trust zone shared by every
+    // session, so a session must never be able to observe a half-applied archive --
+    // and an agent whose steering files arrived late is an agent that behaved like a
+    // different one for its first few seconds.
+    //
+    // A failure here refuses to serve. The alternative is a host that looks healthy
+    // while missing the instructions that define it.
+    if !projection.seed_dir.is_empty() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/workspace".to_string());
+        // Two minutes: enough for a realistic bundle of steering files and skills,
+        // and short enough that a mistake in the seed directory cannot hold a
+        // deployment in PROVISIONING indefinitely.
+        let budget = std::time::Duration::from_secs(120);
+        let applied = openab_pty::seed::apply_dir(
+            std::path::Path::new(&projection.seed_dir),
+            std::path::Path::new(&home),
+            budget,
+        )
+        .context("refusing to serve: seeded state could not be applied")?;
+        if applied.archives.is_empty() {
+            tracing::info!("seed: nothing to apply");
+        }
+    }
+
     let tokens = TokenStore::new(projection.attach_token_ttl, audit.clone());
     let verifier = tokens.attach_verifier();
     let admin =
