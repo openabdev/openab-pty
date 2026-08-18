@@ -60,6 +60,26 @@ pub const ENV_ALLOWLIST: &[&str] = &["TERM", "LANG", "PATH", "HOME", "USER", "SH
 /// Locale variables are allowlisted by prefix (`LC_ALL`, `LC_CTYPE`, ...).
 pub const ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_"];
 
+/// Container variables the operator has explicitly chosen to hand to sessions.
+///
+/// `PTY_FORWARD_KIRO_API_KEY` in the container becomes `KIRO_API_KEY` in the shell.
+/// This is a deliberate hole in the allowlist above, and it is worth being exact
+/// about what changes: the allowlist exists so that the *operator's* credentials --
+/// cloud keys, platform tokens, anything the runtime happened to inherit -- cannot
+/// leak into a shell by accident. A forward is not an accident. It carries only a
+/// value named one at a time in the task definition, and the value reaches the
+/// container from Secrets Manager rather than from the runtime's own environment.
+///
+/// It does still weaken the guarantee, and the ADR says so rather than glossing it:
+/// an agent that needs an API key will have that key in its process environment,
+/// where `env` prints it and scrollback replays it. That is the cost of the agent
+/// being able to authenticate at all, not something this design can avoid.
+///
+/// Forwards add; they never replace. A forward named `PTY_FORWARD_PATH` is refused,
+/// because silently rewriting `PATH` or `HOME` from a manifest is a different and
+/// much less obvious thing than adding a variable.
+pub const ENV_FORWARD_PREFIX: &str = "PTY_FORWARD_";
+
 const DEFAULT_TERM: &str = "xterm-256color";
 /// Read chunk from the PTY master.
 const READ_CHUNK: usize = 16 * 1024;
@@ -203,15 +223,47 @@ pub fn child_env<I>(source: I, home: &str, size_term: Option<&str>) -> Vec<(Stri
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    let source: Vec<(String, String)> = source.into_iter().collect();
+
     let mut env: Vec<(String, String)> = source
-        .into_iter()
+        .iter()
         .filter(|(key, _)| {
             ENV_ALLOWLIST.contains(&key.as_str())
                 || ENV_ALLOWLIST_PREFIXES
                     .iter()
                     .any(|prefix| key.starts_with(prefix))
         })
+        .cloned()
         .collect();
+
+    // Explicit forwards, after the allowlist so a forward cannot shadow one.
+    for (key, value) in &source {
+        let Some(name) = key.strip_prefix(ENV_FORWARD_PREFIX) else {
+            continue;
+        };
+        if name.is_empty() {
+            tracing::warn!("ignoring {ENV_FORWARD_PREFIX} with no name after the prefix");
+            continue;
+        }
+        if ENV_ALLOWLIST.contains(&name)
+            || ENV_ALLOWLIST_PREFIXES.iter().any(|p| name.starts_with(p))
+        {
+            // Refused rather than applied: rewriting PATH or HOME from a manifest is
+            // a different act from adding a variable, and a silent one.
+            tracing::warn!(
+                variable = name,
+                "refusing to forward a variable that would replace an allowlisted one"
+            );
+            continue;
+        }
+        // The name only. A forwarded value is a credential by assumption.
+        tracing::info!(
+            variable = name,
+            "forwarding operator-declared variable to sessions"
+        );
+        env.push((name.to_string(), value.clone()));
+    }
+
     env.sort();
     env.dedup_by(|a, b| a.0 == b.0);
     if !env.iter().any(|(key, _)| key == "TERM") {
@@ -2029,6 +2081,86 @@ mod tests {
             !env.iter().any(|(_, value)| value == "leak"),
             "no credential-shaped variable may reach the child: {env:?}"
         );
+    }
+
+    #[test]
+    fn child_env_forwards_only_variables_the_operator_named() {
+        // The point of the feature: an agent that authenticates with an API key needs
+        // that key in its environment, and the operator says so one variable at a
+        // time in the task definition.
+        let env = child_env(
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                (
+                    "PTY_FORWARD_KIRO_API_KEY".to_string(),
+                    "sk-abc123".to_string(),
+                ),
+                // Not forwarded: no prefix, so the allowlist still drops it.
+                ("ANTHROPIC_API_KEY".to_string(), "leaked".to_string()),
+                // Not forwarded: the runtime's own config is not for sessions.
+                ("PTY_ADMIN_HASH".to_string(), "sha256:dead".to_string()),
+            ],
+            "/workspace",
+            None,
+        );
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            map.get("KIRO_API_KEY").map(String::as_str),
+            Some("sk-abc123")
+        );
+        assert!(
+            !map.contains_key("PTY_FORWARD_KIRO_API_KEY"),
+            "the prefix must be stripped"
+        );
+        assert!(
+            !map.contains_key("ANTHROPIC_API_KEY"),
+            "an unnamed credential must not pass"
+        );
+        assert!(
+            !map.contains_key("PTY_ADMIN_HASH"),
+            "runtime config must not reach a shell"
+        );
+    }
+
+    #[test]
+    fn child_env_refuses_a_forward_that_would_replace_an_allowlisted_variable() {
+        // Adding a variable and silently rewriting PATH are different acts. The
+        // second one is refused, and the inherited value survives.
+        let env = child_env(
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("HOME".to_string(), "/workspace".to_string()),
+                ("PTY_FORWARD_PATH".to_string(), "/tmp/evil".to_string()),
+                ("PTY_FORWARD_HOME".to_string(), "/tmp".to_string()),
+                ("PTY_FORWARD_LC_ALL".to_string(), "C".to_string()),
+            ],
+            "/workspace",
+            None,
+        );
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(map.get("HOME").map(String::as_str), Some("/workspace"));
+        assert!(
+            !map.contains_key("LC_ALL"),
+            "a prefixed allowlist entry is also protected"
+        );
+    }
+
+    #[test]
+    fn child_env_ignores_a_forward_with_no_name() {
+        let env = child_env(
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("PTY_FORWARD_".to_string(), "nameless".to_string()),
+            ],
+            "/workspace",
+            None,
+        );
+        assert!(
+            env.iter().all(|(k, _)| !k.is_empty()),
+            "an empty name must not be injected"
+        );
+        assert!(env.iter().all(|(_, v)| v != "nameless"));
     }
 
     #[test]
