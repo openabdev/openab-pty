@@ -64,7 +64,7 @@ spec:
       command:
         - 'set -e; mkdir -p /tmp/tsstate; tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/tailscaled.sock >/tmp/tailscaled.log 2>&1 & for i in $(seq 1 60); do [ -S /tmp/tailscaled.sock ] && break; sleep 1; done; tailscale --socket=/tmp/tailscaled.sock up --authkey="$TS_AUTHKEY" --hostname=pty-kiro --accept-dns=false; tailscale --socket=/tmp/tailscaled.sock ip -4; tail -f /tmp/tailscaled.log'
       secrets:
-        TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:TS_AUTHKEY::"
+        TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/kiro-AbCdEf:TS_AUTHKEY::"
       logGroup: /ecs/pty-kiro
 
     - name: openab-pty
@@ -88,7 +88,7 @@ spec:
         # A hash, not the credential. The validator refuses ${VAR} on this key
         # specifically, so the entrypoint materialises a projection containing the
         # literal value. Generate with: openab-pty --generate-admin-credential
-        PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:PTY_ADMIN_HASH::"
+        PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/kiro-AbCdEf:PTY_ADMIN_HASH::"
       mountPoints:
         /workspace: workspace
         /tmp: tmp

@@ -152,6 +152,22 @@ echo "$CRED"   # give this to the client; it is never stored server-side
 echo "$HASH"   # this goes in the secret
 ```
 
+> **Save `$CRED` somewhere durable before you continue.** It exists only in that
+> shell. AWS stores the hash, the task definition stores the hash, the runtime
+> stores the hash — nothing anywhere holds the plaintext, by design. There is no
+> recovery path, only replacement:
+>
+> ```bash
+> NEW=$(openssl rand -hex 32)
+> HASH="sha256:$(printf '%s' "$NEW" | sha256sum | cut -d' ' -f1)"
+> aws secretsmanager put-secret-value --secret-id openab-pty/kiro --region us-east-1 \
+>   --secret-string "{\"PTY_ADMIN_HASH\":\"$HASH\",\"TS_AUTHKEY\":\"<existing key>\"}"
+> ecsctl restart pty-kiro   # the secret is read at startup
+> ```
+>
+> That replaces the task, so every session and everything running inside it is
+> gone. Losing the credential costs you the sessions, not just the login.
+
 `admin_credential_hash` is the one config key the validator refuses `${VAR}` on.
 A fail-open there would let a poisoned projection disable admin auth, so the
 entrypoint materialises a projection containing the literal hash, and the hash
@@ -274,6 +290,53 @@ curl -s -X POST http://$IP:8090/admin/sessions \
 
 Then attach with the macOS client in [`clients/macos/`](../clients/macos/), or
 any client written to [`runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
+
+---
+
+## The two values a client needs
+
+After a deploy, a client needs a base URL and a credential. They come from
+different places, and only one of them is recoverable.
+
+### base URL — from tailscale, not from ecsctl
+
+`ecsctl` registers task definitions and services; it knows nothing about the
+tailnet. The address is assigned by Tailscale when `tailscaled` joins, so ask
+Tailscale:
+
+```bash
+tailscale status | grep pty-kiro
+# 100.64.0.1   pty-kiro   example-tailnet@   linux   active; direct 54.83.120.42:50812
+```
+
+The `tailscale` container also prints its own address at startup (`tailscale ip
+-4`), visible in the log, but running `tailscale status` on your own machine is
+more direct.
+
+**The address changes on every redeploy.** A new task is a new tailnet node — one
+service in a single afternoon went through `100.64.0.2`,
+`100.64.0.3` and `100.64.0.1`. Do not hard-code it anywhere; look it up
+after each deploy. `active; direct` rather than `relay "..."` means the
+connection is peer-to-peer, which is the lower-latency path.
+
+### credential — from wherever you saved it at generation time
+
+There is no command that retrieves it. What the deployment holds is the verifier:
+
+```bash
+aws secretsmanager get-secret-value --secret-id openab-pty/kiro \
+  --region us-east-1 --query SecretString --output text
+# {"PTY_ADMIN_HASH":"sha256:bf7bc7b7...","TS_AUTHKEY":"tskey-auth-..."}
+```
+
+You can confirm a credential you still hold matches the deployment:
+
+```bash
+printf '%s' "$CRED" | sha256sum   # compare with PTY_ADMIN_HASH
+```
+
+but you cannot go the other way. See the warning under prerequisite 2 for what
+to do when it is lost.
 
 ---
 
