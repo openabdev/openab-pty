@@ -37,23 +37,36 @@ are documented anywhere obvious:
 Replace `SUFFIX` in the secret ARN with the real one, and point the image at your
 own registry.
 
-## CI-built image (ECR)
+## CI-built images (GHCR, public)
 
 `.github/workflows/image.yml` builds this Dockerfile on every push to `main` and
-tag, and pushes to a private ECR repository (`openab-pty` in `123456789012`,
-`us-east-1`) — not GHCR. Authentication is GitHub OIDC to a scoped IAM role
-(`openab-pty-ci`, trust condition restricted to `refs/heads/main` and
-`refs/tags/*` in this repository), so no long-lived credential is stored
-anywhere. The role can push and pull exactly this one ECR repository and
-nothing else.
+every `v*` tag, as a matrix over every agent-CLI variant the openab base ships
+except `agentcore`. Images go to `ghcr.io/openabdev/openab-pty`, authenticated
+with the workflow's own `GITHUB_TOKEN` — no long-lived credential anywhere.
 
-This does not touch Gate B. Gate B on openabdev/openab#1479 governs *publishing*
-an image, chart or docs; a private-account ECR push that nothing points a user
-at is neither.
+Two channels, each tracking the *same* channel of the base so a tag never claims
+more stability than what it was built from:
 
-The base image (`ghcr.io/openabdev/openab`) is pinned by digest, matched to the
-fleet's `pre-beta-kiro` tag rather than `:latest` — the two were different
-images (openab 0.10.0 vs 0.9.0) when this was pinned. A scheduled workflow
-(`bump-base-image.yml`) re-resolves that tag weekly and opens a PR if it moved,
+| Trigger | openab-pty tag | Built FROM |
+|---|---|---|
+| push to `main` | `pre-beta-<variant>` | `openab:pre-beta-<variant>` |
+| `v*` tag | `beta-<variant>` | `openab:beta-<variant>` |
+
+Every build also gets an immutable `<variant>-<sha>`. Deploying only the moving
+tag makes "which code is running" unanswerable after the fact.
+
+There is deliberately no `stable` channel: openab publishes no `stable-*` tag, so
+an `openab-pty:stable-*` would have nothing to track and would in fact be built
+from a pre-beta or beta base — a label that lies. Add one when the base grows one.
+
+**Public images need no pull secret.** That is the practical reason for GHCR over
+the private ECR this used to push to: the ECR token expired every 12 hours and had
+to be refreshed in every cluster before a deploy would pull. See [`../NOTICE`](../NOTICE)
+for what the images contain and under whose terms.
+
+The base image is pinned by digest, resolved per variant at build time and recorded
+in the job log, so a base change cannot silently alter the output of an unchanged
+commit. A scheduled workflow (`bump-base-image.yml`) re-resolves the tracked tag
+weekly and opens a PR if it moved,
 so staying current is a reviewed decision rather than a build silently
 re-resolving a tag on every run.

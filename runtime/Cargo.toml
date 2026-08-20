@@ -3,6 +3,8 @@ name = "openab-pty"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/openabdev/openab-pty"
+license = "MIT"
 description = "OpenAB PTY runtime — remote sandboxed terminal sessions over WebSocket (internal, unpublished)"
 
 [dependencies]

@@ -1,0 +1,53 @@
+# NOTICE
+
+## What the MIT licence covers
+
+`LICENSE` (MIT) covers **the contents of this repository**: the Rust runtime under
+`runtime/`, the `Dockerfile`, the deployment manifests under `deploy/`, and the
+documentation. All of it is openabdev's own work.
+
+## What it does not cover
+
+**The container images built from this repository are a separate artifact, and the
+MIT licence does not extend to their contents.**
+
+A `Dockerfile` is a recipe, not a payload. The line
+
+```
+FROM ghcr.io/openabdev/openab@sha256:…
+```
+
+*references* a base image; it does not contain or redistribute it. But the image
+produced by running that recipe does. Each published
+`ghcr.io/openabdev/openab-pty:<channel>-<variant>` image aggregates:
+
+| Layer | Origin | Terms |
+|---|---|---|
+| `openab-pty` runtime binary | this repository | MIT (`LICENSE`) |
+| `openab` base image | `openabdev/openab` | MIT, for openab's own code |
+| agent CLI for that variant | third-party vendor | **the vendor's own terms** |
+
+Bundling separately-licensed software in a container image is mere aggregation: it
+relicenses neither part. The runtime stays MIT; the agent CLI stays under whatever
+its vendor grants.
+
+## If you pull these images
+
+Each variant (`claude`, `codex`, `cursor`, `devin`, `copilot`, `gemini`, `grok`,
+`hermes`, `kiro`, `mimocode`, `antigravity`, `opencode`, `pi`) carries that
+vendor's coding CLI, installed by the `openab` base image. Those CLIs are
+proprietary and their licence terms, including whether they may be redistributed
+or used in an automated context, are set by their vendors and vary between them.
+**Using an image implies accepting the terms of the CLI inside it.** Check the
+vendor's terms for the variant you intend to use; this project makes no
+representation about them and grants no rights over them.
+
+The `native` variant carries **no** agent CLI. It is the only variant whose image
+contents are covered entirely by MIT-licensed code, and is the appropriate choice
+where third-party redistribution terms are a concern.
+
+## Building your own
+
+Nothing here requires the published images. `docker build .` from a clean checkout
+produces the runtime from source, and `OPENAB_BASE_DIGEST` selects the base — point
+it at a base of your choosing, including one with no agent CLI.

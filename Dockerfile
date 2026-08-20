@@ -72,6 +72,10 @@ RUN touch src/main.rs src/lib.rs \
 #   curl -s -H "Authorization: Bearer $T" \
 #     -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
 #     https://ghcr.io/v2/openabdev/openab/manifests/pre-beta-kiro | jq -r '.manifests[]|select(.platform.architecture=="amd64").digest'
+# LICENSING BOUNDARY. This repository is MIT (see LICENSE). That covers the recipe
+# below, not what the recipe pulls in: the image built from this line aggregates
+# the openab base and, for every variant except `native`, a third-party agent CLI
+# under its vendor's own terms. MIT does not and cannot relicense those. See NOTICE.
 FROM ghcr.io/openabdev/openab@${OPENAB_BASE_DIGEST}
 
 COPY --from=builder --chown=root:root --chmod=755 \

@@ -3,12 +3,20 @@
 Remote sandboxed terminal sessions: a small runtime that hands out a shell inside
 a locked-down container, plus the clients that attach to it.
 
-**Private and unpublished.** No image is published, no chart ships, and there is no
-user-facing documentation, per the Gate A decision recorded on the tracking issue
-in `openabdev/openab`. The design of record is
+**MIT licensed, images published to GHCR.** See [`LICENSE`](LICENSE) — and
+[`NOTICE`](NOTICE) before pulling an image, because the images aggregate a
+third-party agent CLI whose terms are its vendor's, not MIT.
+
+The pre-implementation gate that previously kept this private
+([openabdev/openab#1479](https://github.com/openabdev/openab/issues/1479)) was
+closed as superseded on 2026-08-20: Phase 1 had already been implemented, so the
+gate no longer governed the decision it existed to govern. Its demand component
+was never satisfied — that question is unanswered rather than answered.
+
+The design of record is
 [`docs/adr/openab-pty-runtime.md`](https://github.com/openabdev/openab/blob/main/docs/adr/openab-pty-runtime.md)
-there, and it stays there: it is a decision record for the OAB project, not for
-this repository.
+in `openabdev/openab`, and it stays there: it is a decision record for the OAB
+project, not for this repository.
 
 ## Layout
 

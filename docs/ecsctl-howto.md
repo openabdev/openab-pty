@@ -1,9 +1,7 @@
 # Deploying openab-pty on ECS Fargate with ecsctl
 
-Operator notes for this repository. **Not user-facing documentation** — Gate B on
-[openabdev/openab#1479](https://github.com/openabdev/openab/issues/1479) governs
-publishing docs, and it stays closed. This is the internal runbook for people who
-already have the credentials.
+Operator notes for this repository. These are runbook notes for people who already
+have the credentials, not a getting-started guide.
 
 Everything below was executed against real Fargate, not written from the API
 reference. Where a step exists only because something failed, the failure is

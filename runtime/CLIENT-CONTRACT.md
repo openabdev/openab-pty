@@ -4,8 +4,8 @@ Implementation spec for a native client (macOS first, then iOS). Every shape
 below was captured from the running Phase 1 runtime, not transcribed from the
 source, so it reflects what a client will actually receive.
 
-**Status:** internal spec. Not user documentation — the Gate A revision on the
-tracking issue excludes user docs while the runtime is unpublished.
+**Status:** implementation spec, not a tutorial. It describes the wire contract a
+client must satisfy; it does not walk a user through using one.
 
 ---
 
