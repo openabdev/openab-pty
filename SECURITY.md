@@ -37,9 +37,14 @@ vulnerability:
    service-account token, no host credentials, read-only root filesystem,
    ephemeral workspace. A path to `root`, to the host, to cloud credentials, or to
    a writable root filesystem is a vulnerability.
-5. **The runtime does not listen on a routable address.** It binds loopback; the
-   tailnet sidecar is the only network identity. A configuration that exposes the
-   listener directly is a vulnerability.
+5. **An off-loopback bind is refused unless it is explicitly made safe.** The
+   default is `127.0.0.1:8090`, and the tailnet sidecar is the only network
+   identity. Binding a routable address is *permitted* — but only when an admin
+   credential hash is configured **and** the deployment declares
+   `tls_terminated_upstream`, because this runtime holds no TLS key. A bind that
+   escapes both conditions, or an unparseable host treated as loopback, is a
+   vulnerability. Binding `0.0.0.0` with a credential and a declared upstream
+   terminator is not: it is a supported deployment, covered by a test.
 
 ## Known limits — please do not report these
 
@@ -55,6 +60,22 @@ time and gets a "working as intended" reply:
 - **Anyone holding the admin credential controls every session.** That is what the
   credential is. Protecting it is the operator's job; the client keeps it in the
   system keychain.
+- **The admin failure throttle collapses to one bucket in the shipped topology.**
+  It is keyed on the peer IP, deliberately ignoring `X-Forwarded-For` because that
+  header is client-settable. But the tailnet sidecar proxies to loopback, so every
+  caller arrives as `127.0.0.1` and shares a single bucket. Anyone who can reach
+  the pod's tailnet address can therefore hold that bucket at its ceiling with
+  unauthenticated requests and keep the real operator receiving `429`. It is
+  bounded rather than permanent — 100 ms doubling to a 5 s cap, forgotten after
+  60 s — and it grants no access, so it is a nuisance rather than an escalation.
+  Scoping who can reach the tailnet address is a tailnet ACL question. Report a
+  way to make the block *permanent*, or to trigger it as an authenticated caller.
+- **Probes must carry the credential.** A consequence of the above: an
+  unauthenticated poller — a liveness probe, a "is it up yet" loop — throttles the
+  shared bucket before a real request arrives. An authenticated probe consumes no
+  failure budget. A client testing whether the admin plane refuses correctly must
+  treat `401` **and** `429` as a refusal; only a `200` without a credential is a
+  finding.
 - **The tailnet is trusted.** Anything on your tailnet can reach the sidecar.
   Scoping that is a tailnet ACL question, not a runtime one.
 - **Third-party agent CLIs inside the published images.** Every variant except
