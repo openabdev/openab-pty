@@ -19,9 +19,6 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: openab-pty
-  # Names the base variant, because the base decides which agent CLI a session
-  # lands next to. Change the base and this changes with it.
-  VARIANT: kiro
 
 jobs:
   # The image is built from whatever the tests ran against, not in parallel with
@@ -33,6 +30,16 @@ jobs:
   image:
     needs: ci
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every agent CLI the openab base image ships a variant for, except
+        # agentcore (excluded by decision). The base decides which agent CLI a
+        # session lands next to; one openab-pty image per variant keeps that
+        # adjacency: deploy openab-pty:pre-beta-claude and the terminal opens
+        # beside claude, and so on.
+        variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
+                  grok, hermes, kiro, mimocode, native, opencode, pi]
     permissions:
       contents: read
       # Required to request the OIDC token. Deliberately no `packages:` scope:
@@ -41,15 +48,27 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Work out the tags
+      - name: Work out the tags and resolve the base digest
         id: meta
         run: |
           SHORT="$(git rev-parse --short HEAD)"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
-          # A moving tag for convenience plus an immutable one for provenance.
-          # Deploying the moving tag alone makes "which code is running"
-          # unanswerable after the fact.
-          echo "tags=pre-beta-${VARIANT},${VARIANT}-${SHORT}" >> "$GITHUB_OUTPUT"
+
+          # Resolve the amd64 digest of the variant's base tag at build time.
+          # Digest-pinning still holds — the digest is recorded in the job log
+          # and baked into the provenance of this exact build, rather than the
+          # tag silently re-resolving with nothing written down.
+          T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
+          DIGEST=$(curl -s -H "Authorization: Bearer $T" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/openabdev/openab/manifests/pre-beta-${{ matrix.variant }}" \
+            | jq -r '.manifests[]|select(.platform.architecture=="amd64").digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "FAIL: could not resolve digest for pre-beta-${{ matrix.variant }}" >&2
+            exit 1
+          fi
+          echo "base_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Resolved pre-beta-${{ matrix.variant }} -> $DIGEST"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -77,7 +96,9 @@ jobs:
           # would roughly double the build for nothing that currently runs.
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ github.event_name != 'pull_request' && format('{0}/{1}:pre-beta-{2},{0}/{1}:{2}-{3}', steps.login.outputs.registry, env.ECR_REPOSITORY, env.VARIANT, steps.meta.outputs.short) || 'openab-pty:pr' }}
+          build-args: |
+            OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
+          tags: ${{ github.event_name != 'pull_request' && format('{0}/{1}:pre-beta-{2},{0}/{1}:{2}-{3}', steps.login.outputs.registry, env.ECR_REPOSITORY, matrix.variant, steps.meta.outputs.short) || 'openab-pty:pr' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
@@ -89,7 +110,7 @@ jobs:
       - name: Smoke test the built image
         if: github.event_name != 'pull_request'
         env:
-          IMAGE: ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.VARIANT }}-${{ steps.meta.outputs.short }}
+          IMAGE: ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ matrix.variant }}-${{ steps.meta.outputs.short }}
         run: |
           set -euo pipefail
           docker pull -q "$IMAGE"
@@ -143,8 +164,8 @@ jobs:
             echo "### Image pushed"
             echo
             echo '```'
-            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.VARIANT }}-${{ steps.meta.outputs.short }}"
-            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pre-beta-${{ env.VARIANT }}"
+            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ matrix.variant }}-${{ steps.meta.outputs.short }}"
+            echo "${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pre-beta-${{ matrix.variant }}"
             echo '```'
             echo
             echo "Private ECR. Not published — Gate B on openabdev/openab#1479 stays closed."

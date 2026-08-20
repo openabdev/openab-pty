@@ -1,0 +1,88 @@
+apiVersion: ecsctl/v1
+kind: Service
+metadata:
+  name: openab-pty-test
+  cluster: openab
+
+# The same three-container shape that previously had to be hand-assembled as
+# raw RegisterTaskDefinition JSON (deploy/ecs/taskdef.json), expressed as an
+# ecsctl spec. Reachability comes from the tailscale sidecar sharing this task's
+# network namespace; the runtime itself binds loopback only and refuses an
+# off-loopback bind while it holds no TLS key.
+spec:
+  cpu: "1024"
+  memory: "2048"
+  arch: X86_64
+  capacity: FARGATE
+  desiredCount: 1
+  execEnabled: true
+
+  subnets:
+    - subnet-0564da5939b9f37e8
+  securityGroups:
+    - sg-0bc22bce7e98d79b0
+  assignPublicIp: true
+
+  executionRoleArn: "arn:aws:iam::123456789012:role/openab-pty-test-execution-role"
+  taskRoleArn: "arn:aws:iam::123456789012:role/oab-task-role-telegram-ingress-demo"
+
+  # Fargate bind mounts are root-owned with no fsGroup equivalent, so a uid 1000
+  # container cannot write to them until something chowns them.
+  volumes:
+    - name: workspace
+    - name: tmp
+
+  containers:
+    # Runs as root, chowns the shared volumes, exits. The app container waits
+    # for it to exit zero. essential: false is required, not stylistic: AWS
+    # refuses a SUCCESS/COMPLETE dependency on an essential container.
+    - name: init-perms
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      essential: false
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      command:
+        - "chown 1000:1000 /workspace /tmp && chmod 700 /workspace && echo 'volumes chowned to uid 1000'"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/openab-pty-test
+
+    # Joins the tailnet and proxies inbound connections to loopback. containerboot
+    # fails here (socket timeout in under a second), so tailscaled and tailscale up
+    # are driven directly.
+    - name: tailscale
+      image: tailscale/tailscale:stable
+      essential: true
+      user: "0"
+      entryPoint: ["/bin/sh", "-c"]
+      # Single-quoted YAML scalar: the script contains ": " sequences and "$"
+      # expansions that a bare scalar cannot hold. Inner single quotes are
+      # doubled per YAML escaping.
+      command:
+        - 'set -e; mkdir -p /tmp/tsstate; tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/tailscaled.sock >/tmp/tailscaled.log 2>&1 & for i in $(seq 1 60); do [ -S /tmp/tailscaled.sock ] && break; sleep 1; done; tailscale --socket=/tmp/tailscaled.sock up --authkey="$TS_AUTHKEY" --hostname=oab-pty-fargate --accept-dns=false; echo ''tailnet up:''; tailscale --socket=/tmp/tailscaled.sock ip -4; tail -f /tmp/tailscaled.log'
+      secrets:
+        TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:TS_AUTHKEY::"
+      logGroup: /ecs/openab-pty-test
+
+    # The runtime. Non-root, read-only root filesystem, all capabilities dropped.
+    - name: openab-pty
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      essential: true
+      user: "1000"
+      readonlyRootFilesystem: true
+      linuxParameters:
+        capabilitiesDrop: ["ALL"]
+      dependsOn:
+        - containerName: init-perms
+          condition: SUCCESS
+      env:
+        PTY_LISTEN: 127.0.0.1:8090
+        PTY_COMMAND: /usr/bin/bash
+        HOME: /workspace
+      secrets:
+        PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:PTY_ADMIN_HASH::"
+      mountPoints:
+        /workspace: workspace
+        /tmp: tmp
+      logGroup: /ecs/openab-pty-test
