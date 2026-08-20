@@ -11,6 +11,35 @@ if [[ -z "${PTY_ADMIN_HASH:-}" ]]; then
     exit 64
 fi
 
+# Every PTY_* value below is interpolated into a generated TOML document, so a
+# value carrying a quote or a newline can close its own string and append keys.
+# These come from the deployment — a pod spec or a task definition — which is
+# already a trusted surface: anyone who can set them can set the image. So this is
+# not a privilege boundary. It is about failing here, naming the variable, instead
+# of failing two steps later as a TOML parse error that names a line number in a
+# file the operator never wrote.
+#
+# The numeric fields are the sharper edge: they are interpolated bare, so they
+# need no quote to escape at all.
+die() { echo "openab-pty-entrypoint: $1" >&2; exit 64; }
+
+for var in PTY_LISTEN PTY_COMMAND PTY_ABSOLUTE_TTL PTY_IDLE_TTL PTY_TOKEN_TTL \
+           PTY_ADMIN_HASH PTY_SEED_DIR PTY_CONFIG_DIR; do
+    case ${!var:-} in
+        *'"'* | *'\'* | *$'\n'*)
+            die "$var must not contain a quote, backslash or newline: it is interpolated into config.toml" ;;
+    esac
+done
+
+for var in PTY_MAX_SESSIONS PTY_SCROLLBACK_KIB; do
+    [[ ${!var:-} =~ ^[0-9]+$ ]] || die "$var must be a bare non-negative integer, got: ${!var:-}"
+done
+
+case ${PTY_ADMIN_HASH} in
+    sha256:*) : ;;
+    *) die "PTY_ADMIN_HASH must start with sha256: (length ${#PTY_ADMIN_HASH})" ;;
+esac
+
 CONFIG_DIR="${PTY_CONFIG_DIR:-/tmp/openab-pty}"
 mkdir -p "$CONFIG_DIR"
 CONFIG="$CONFIG_DIR/config.toml"

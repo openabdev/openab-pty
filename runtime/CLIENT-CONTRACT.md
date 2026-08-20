@@ -142,6 +142,35 @@ Server → client control: `gap` (with `bytes_dropped`, on ring-buffer overflow 
 clear and redraw rather than rendering a sliced ANSI stream) and `ttl-warning`
 (precedes forced teardown).
 
+### 4.1 PTY output is not sanitised — that part is yours
+
+Binary frames are the shell's bytes, **verbatim**. The runtime filters the
+*client → PTY* direction only, and only for terminal-capability replies (§6 of the
+ADR): an emulator that answers Device Attributes on its own would otherwise inject
+those replies into the agent CLI's stdin. Nothing filters PTY → client, and that is
+deliberate — it is a terminal, and a runtime that stripped escape sequences would
+break the programs people attach to it.
+
+The consequence for you: **the byte stream is untrusted input to your renderer.**
+Whatever runs in that shell — an agent CLI, a compromised dependency, a file the
+user `cat`s — chooses those bytes. Depending on what you feed them to, escape
+sequences can set the window title, write the system clipboard (OSC 52), emit
+hyperlinks (OSC 8), request a reply that your emulator will answer, or simply
+desynchronise your parser.
+
+So decide, explicitly rather than by default:
+
+- Which OSC and DCS sequences you pass to your emulator. Clipboard writes and
+  title changes are the ones with effects outside the terminal view.
+- Whether your emulator answers queries, and if so that those replies go back over
+  the socket as input — the runtime's filter exists precisely because they do.
+- What you do with a `gap`: clear and redraw. Resuming mid-sequence hands your
+  parser a truncated escape.
+
+A client that pipes frames straight into a full-featured emulator inherits every
+capability that emulator has. That is a client-side decision, and the runtime
+cannot make it for you without ceasing to be a terminal.
+
 ## 5. Close codes
 
 | Code | Meaning | Client action |
