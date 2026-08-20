@@ -15,6 +15,34 @@ features: the shell opens as `uid 1000` with no `sudo`, no service-account token
 no host credentials, a read-only root filesystem, and an ephemeral workspace, and
 it is reached over a tailnet with per-session tokens that carry no signing key.
 
+## How this relates to `openab`
+
+[`openabdev/openab`](https://github.com/openabdev/openab) is an **Open Agent
+Broker**: it bridges a chat client to an ACP-compatible coding CLI, brokering
+stdio JSON-RPC so you can instruct an agent from Discord or Slack. You talk; the
+agent acts.
+
+`openab-pty` is the other half of that loop. It gives you a **shell** — you act,
+directly, on the same machine the agent is working on. It speaks no ACP and
+brokers nothing:
+
+| | `openab` | `openab-pty` |
+|---|---|---|
+| What you get | an agent you send instructions to | a terminal you type in |
+| Protocol | ACP over stdio JSON-RPC, bridged to chat | a PTY streamed over WebSocket |
+| Who performs the work | the agent, on your behalf | you |
+| Front end | Discord, Slack, Telegram, … | any client speaking the contract below |
+
+The images are `FROM ghcr.io/openabdev/openab`, and that is the point rather than
+convenience: the shell opens inside the same image the agent runs in, with the same
+agent CLI and the same workspace already present. When an agent leaves something
+half-finished, you attach and look at it *in situ* instead of reproducing it
+somewhere else.
+
+The two are independent, though. Neither requires the other — this runtime is
+useful on its own as a sandboxed remote terminal, and `openab` does not need a
+terminal to broker agents.
+
 ## Architecture
 
 Two containers in one pod. The runtime never listens on a routable address — the
