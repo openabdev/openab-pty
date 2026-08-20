@@ -162,7 +162,25 @@ fn extract_tarball_budgeted(
             }
         }
 
-        entry.unpack_in(dest)?;
+        // `unpack_in` returns Ok(false) for an entry it *refused* to write because
+        // the path escaped `dest`. Dropping that bool was a real hole: the
+        // permission pass below ran regardless, and it rebuilds the path itself
+        // from the unsanitized header — and `Path::join` with an absolute path
+        // discards the base entirely, so `dest.join("/x")` is `/x` and
+        // `dest.join("../x")` normalizes outside `dest`. An archive could
+        // therefore chmod a file it was never allowed to create. Bounded by uid
+        // 1000 owning the target, which is exactly the agent's own workspace and
+        // credentials, so it was worth closing rather than rating away.
+        if !entry.unpack_in(dest)? {
+            warn!(
+                "seed: skipping entry that unpack_in refused as escaping: {}",
+                entry
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+            continue;
+        }
 
         // Manually set permissions (strip suid/sgid/sticky, like zip path)
         #[cfg(unix)]
@@ -170,10 +188,15 @@ fn extract_tarball_budgeted(
             use std::os::unix::fs::PermissionsExt;
             if let Ok(path) = entry.path() {
                 let out_path = dest.join(path);
-                if out_path
-                    .symlink_metadata()
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false)
+                // Defence in depth behind the skip above: re-establish containment
+                // on the path this pass actually chmods, rather than trusting that
+                // the entry which got here was the sanitized one.
+                let contained = normalize_path(&out_path).starts_with(normalize_path(dest));
+                if contained
+                    && out_path
+                        .symlink_metadata()
+                        .map(|m| m.file_type().is_file())
+                        .unwrap_or(false)
                 {
                     let mode = entry.header().mode().unwrap_or(0o644) & 0o0777;
                     let _ =
@@ -553,6 +576,62 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("sub/nested.txt")).unwrap(),
             "nested content"
+        );
+    }
+
+    /// An entry whose path escapes `dest` is refused by `unpack_in`, and must not
+    /// reach the permission pass either. That pass rebuilds the path from the
+    /// unsanitized header, and `Path::join` on a traversing path lands outside
+    /// `dest` — so before the skip was honoured, an archive could chmod a file it
+    /// was never allowed to create.
+    #[test]
+    fn an_escaping_entry_cannot_chmod_a_file_outside_dest() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        // The victim sits beside `dest`, reachable from it by one `..` hop, and is
+        // owned by this uid so a chmod would actually succeed.
+        let victim = root.path().join("victim.txt");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        // The header is crafted by hand rather than via `append_data`, because
+        // `Builder::set_path` rejects `..` outright ("paths in archives must not
+        // have `..`"). That refusal is why this hole survived: a test written with
+        // the friendly API cannot express the input that reaches the bug, while a
+        // hostile archive is just bytes and has no such scruples.
+        let mut header = tar::Header::new_gnu();
+        header.set_size(6);
+        // World-readable and -writable: the mode an attacker would want applied.
+        header.set_mode(0o666);
+        header.set_entry_type(tar::EntryType::Regular);
+        let name = b"../victim.txt";
+        header.as_gnu_mut().expect("gnu header").name[..name.len()].copy_from_slice(name);
+        header.set_cksum();
+        builder.append(&header, &b"tainte"[..]).unwrap();
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        // Extraction itself must not fail; the entry is skipped, not fatal.
+        extract_tarball_with_limits(&bytes, &dest, deadline).unwrap();
+
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an escaping entry changed the mode of a file outside dest"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "secret",
+            "an escaping entry overwrote a file outside dest"
         );
     }
 
