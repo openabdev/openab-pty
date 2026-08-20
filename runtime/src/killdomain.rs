@@ -492,6 +492,18 @@ pub struct KillDomain {
     global: Arc<GlobalTracking>,
     signals: Arc<dyn ProcessSignals>,
     audit: AuditLogger,
+    /// Whether `track` may acquire a real pidfd from the kernel.
+    ///
+    /// True for `SystemSignals`, false whenever signals are injected. A pidfd is
+    /// a handle on a *real* process, and `signal_tracked` prefers it over the
+    /// `ProcessSignals` it was given — so with an injected table the pidfd path
+    /// both bypasses the model and signals whatever actually holds that pid. The
+    /// same reasoning as `reap_tracked`'s note above: a diagnostic that
+    /// disagrees with the shipping code proves nothing.
+    ///
+    /// Only read on Linux, because that is the only target with a pidfd path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    real_pidfd: bool,
 }
 
 /// Operator-facing status. Every field an operator could mistake for a
@@ -511,9 +523,18 @@ pub struct KillDomainStatus {
 
 impl KillDomain {
     pub fn new(limits: TrackingLimits, audit: AuditLogger) -> Self {
-        Self::with_signals(limits, audit, Arc::new(SystemSignals))
+        Self {
+            tier: KillDomainTier::Tier1BestEffortProcessGroup,
+            subreaper: establish_subreaper(),
+            global: Arc::new(GlobalTracking::new(limits)),
+            signals: Arc::new(SystemSignals),
+            audit,
+            real_pidfd: true,
+        }
     }
 
+    /// Inject a process table. The pids are then whatever the caller says they
+    /// are, so no real pidfd is opened for them.
     pub fn with_signals(
         limits: TrackingLimits,
         audit: AuditLogger,
@@ -525,6 +546,7 @@ impl KillDomain {
             global: Arc::new(GlobalTracking::new(limits)),
             signals,
             audit,
+            real_pidfd: false,
         }
     }
 
@@ -569,6 +591,7 @@ impl KillDomain {
             global: self.global.clone(),
             signals: self.signals.clone(),
             audit: self.audit.clone(),
+            real_pidfd: self.real_pidfd,
         })
     }
 }
@@ -583,6 +606,8 @@ pub struct SessionKillDomain {
     global: Arc<GlobalTracking>,
     signals: Arc<dyn ProcessSignals>,
     audit: AuditLogger,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    real_pidfd: bool,
 }
 
 impl SessionKillDomain {
@@ -606,7 +631,11 @@ impl SessionKillDomain {
         }
         self.global.reserve()?;
         #[cfg(target_os = "linux")]
-        let pidfd = PidFd::open(pid).ok();
+        let pidfd = if self.real_pidfd {
+            PidFd::open(pid).ok()
+        } else {
+            None
+        };
         self.tracked.push(TrackedChild {
             pid,
             #[cfg(target_os = "linux")]
@@ -956,7 +985,14 @@ mod tests {
 
         // Escapee traps SIGTERM but the tracked-pid SIGKILL pass reaches it.
         let outcome = session_domain.terminate(Duration::from_millis(40)).await;
-        assert!(outcome.converged());
+        assert!(
+            outcome.converged(),
+            "survivors={:?} alive={:?} leaked={} elapsed_ms={}",
+            outcome.survivors,
+            signals.alive_pids(),
+            domain.leaked_process_count(),
+            outcome.elapsed_ms
+        );
         assert!(signals.alive_pids().is_empty());
         assert_eq!(domain.leaked_process_count(), 0);
     }
