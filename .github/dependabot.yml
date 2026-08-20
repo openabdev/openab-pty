@@ -1,0 +1,35 @@
+# Dependency updates. Worth having on a project whose pitch is isolation: a
+# vulnerable transitive crate in the listener is exactly the kind of thing that
+# should not wait for someone to notice it by hand.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /runtime
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: scope
+    groups:
+      # Patch bumps land as one PR; a review per patch release is noise nobody
+      # reads, and unread review is worse than batched review.
+      patch-updates:
+        update-types: [patch]
+
+  # The workflows pin actions by commit SHA, which is the right call but means a
+  # pinned SHA never updates itself. Dependabot understands SHA pins and bumps
+  # them with the tag in a comment, so pinning stays cheap.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"

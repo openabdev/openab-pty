@@ -18,7 +18,7 @@ No public port, no SSH key, no host access.
 ```mermaid
 flowchart LR
     subgraph laptop["Your machine"]
-        client["macOS client<br/><i>clients/macos</i>"]
+        client["Client<br/><i>admin credential in keychain</i>"]
     end
 
     subgraph tailnet["Tailnet · WireGuard"]
@@ -133,7 +133,7 @@ ecsctl --version   # must be >= 0.13.0
 
 ```bash
 # Built by CI on every push to main; see .github/workflows/image.yml
-123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+ghcr.io/openabdev/openab-pty:pre-beta-kiro
 ```
 
 The tag suffix names the base variant, because the base decides which agent CLI
@@ -286,8 +286,9 @@ curl -s -X POST http://$IP:8090/admin/sessions \
 # → {"session":"work","generation":1,"token":"...","token_expires_in_secs":43199}
 ```
 
-Then attach with the macOS client in [`clients/macos/`](../clients/macos/), or
-any client written to [`runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
+Then attach with any client written to
+[`runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md) — §8 is a minimum
+viable one.
 
 ---
 
