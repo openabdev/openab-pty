@@ -19,7 +19,7 @@ ARG OPENAB_BASE_DIGEST=sha256:f466b5641bb9a687b5ffa8c80ce0e6c470ff91e49586e3a75b
 # CI nobody is watching when that happens.
 
 # --- build ------------------------------------------------------------------
-FROM docker.io/library/rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS builder
+FROM docker.io/library/rust:1-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
 
 # musl, so the result is immune to whatever libc the runtime base ships. This is
 # not theoretical tidiness: the runtime base is a separately released image, and
