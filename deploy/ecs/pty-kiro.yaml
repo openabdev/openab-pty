@@ -43,7 +43,7 @@ spec:
     # essential: false is required, not stylistic -- AWS refuses a
     # SUCCESS/COMPLETE dependency on an essential container.
     - name: init-perms
-      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       essential: false
       user: "0"
       entryPoint: ["/bin/sh", "-c"]
@@ -68,7 +68,7 @@ spec:
       logGroup: /ecs/pty-kiro
 
     - name: openab-pty
-      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/openab-pty:pre-beta-kiro
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       essential: true
       user: "1000"
       readonlyRootFilesystem: true

@@ -21,7 +21,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: openab-pty
-  namespace: default
+  namespace: openab-pty
   labels:
     app: openab-pty
 spec:
@@ -50,7 +50,7 @@ spec:
         - name: TS_USERSPACE
           value: "true"
         - name: TS_HOSTNAME
-          value: "oab-pty-p1"
+          value: "openab-pty"
         - name: TS_STATE_DIR
           value: /tmp/tsstate
         # containerboot defaults to storing tailscaled state in a Kubernetes
@@ -82,16 +82,33 @@ spec:
 
     # --------------------------------------------------------------- openab-pty
     - name: openab-pty
-      image: ghcr.io/openabdev/openab:latest
+      # The published image already contains the runtime binary and an entrypoint
+      # that materialises config.toml from the PTY_* environment. Pick the variant
+      # whose agent CLI you want; `native` carries none. See NOTICE for what the
+      # image aggregates and under whose terms.
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       imagePullPolicy: IfNotPresent
-      command: ["/runtime/openab-pty"]
-      args: ["--config", "/etc/openab-pty/config.toml"]
+      # No command/args override: the entrypoint validates the projection and
+      # fails before serving if it is bad, which is more useful than a crash loop.
       env:
-        - name: HOME
-          value: /workspace
-        - name: RUST_LOG
-          value: info
-      # No ports block at all: nothing is published to the host.
+        # The only required variable. It is a non-reversible sha256 verifier, not
+        # the credential — generate the pair with:
+        #   docker run --rm --entrypoint /usr/local/bin/openab-pty \
+        #     ghcr.io/openabdev/openab-pty:pre-beta-kiro --generate-admin-credential
+        # Keep the credential in your client's keychain; only the hash goes here.
+        - name: PTY_ADMIN_HASH
+          valueFrom:
+            secretKeyRef: { name: openab-pty, key: admin-hash }
+        # Everything below has a default baked into the image; these are shown
+        # because they are the ones worth deciding per deployment.
+        - name: PTY_MAX_SESSIONS
+          value: "3"
+        - name: PTY_ABSOLUTE_TTL
+          value: 12h
+        - name: PTY_IDLE_TTL
+          value: 8h
+      # No ports block at all: nothing is published to the host. The listener
+      # stays on 127.0.0.1:8090 and the sidecar above is the only way in.
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -101,30 +118,17 @@ spec:
         requests: { memory: 128Mi, cpu: 100m }
         limits: { memory: 512Mi, cpu: "1" }
       volumeMounts:
-        - name: runtime
-          mountPath: /runtime
-          readOnly: true
-        - name: config
-          mountPath: /etc/openab-pty
-          readOnly: true
         - name: workspace
           mountPath: /workspace
         - name: runtime-state
           mountPath: /run/openab-pty
+        # The entrypoint writes config.toml under /tmp, so this is load-bearing
+        # rather than hygiene: with a read-only root filesystem and no writable
+        # /tmp the container cannot start.
         - name: tmp
           mountPath: /tmp
 
   volumes:
-    - name: runtime
-      hostPath:
-        path: /home/builder/oab-pty/crates/openab-pty/target/x86_64-unknown-linux-musl/release
-        type: Directory
-    - name: config
-      configMap:
-        name: openab-pty-config
-        items:
-          - key: config.toml
-            path: config.toml
     - name: workspace
       emptyDir: {}
     - name: runtime-state
