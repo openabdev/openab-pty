@@ -106,20 +106,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build (and push, off a pull request)
+      # Built into the local daemon, not pushed. The smoke test below is the gate,
+      # and it can only be a gate if nothing is published before it runs — the
+      # previous order pushed first and tested afterwards, so an image that failed
+      # its own contract was public by the time anyone found out.
+      #
+      # `load` also means pull requests now run the smoke test, which they
+      # previously skipped for want of a pushed image to pull.
+      - name: Build into the local daemon
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           # linux/amd64 only. Both deployment targets are amd64, and an arm64 leg
-          # would roughly double the build for nothing that currently runs.
+          # would roughly double the build for nothing that currently runs. It is
+          # also what makes `load` viable: the runner is amd64, so the image can
+          # enter the local daemon without emulation.
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          push: false
+          tags: openab-pty:candidate
           build-args: |
             OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
-          # A moving channel tag for convenience plus an immutable one for
-          # provenance. Deploying the moving tag alone makes "which code is
-          # running" unanswerable after the fact.
-          tags: ${{ github.event_name != 'pull_request' && format('{0}/{1}:{2}-{3},{0}/{1}:{3}-{4}', env.REGISTRY, env.IMAGE_NAME, steps.meta.outputs.channel, matrix.variant, steps.meta.outputs.short) || 'openab-pty:pr' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
@@ -128,13 +135,11 @@ jobs:
       # assuming a successful build means a working image. Both checks below have
       # failed for real reasons before: an entrypoint that could not find its
       # config, and a listener that refused to bind.
-      - name: Smoke test the built image
-        if: github.event_name != 'pull_request'
+      - name: Smoke test the candidate image
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.variant }}-${{ steps.meta.outputs.short }}
+          IMAGE: openab-pty:candidate
         run: |
           set -euo pipefail
-          docker pull -q "$IMAGE"
 
           # 1. It must refuse to start without an admin credential hash, rather
           #    than coming up with authentication disabled.
@@ -177,6 +182,25 @@ jobs:
           echo "ok: uid 1000, no sudo, read-only root filesystem"
 
           docker rm -f pty >/dev/null
+
+      # Pushing by retagging the tested image, rather than asking buildx to build
+      # again, is deliberate: it makes "what was published" and "what passed" the
+      # same bytes by construction instead of by assumption.
+      - name: Push the image that passed
+        if: github.event_name != 'pull_request'
+        env:
+          MOVING: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.channel }}-${{ matrix.variant }}
+          IMMUTABLE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.variant }}-${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          # A moving channel tag for convenience plus an immutable one for
+          # provenance. Deploying the moving tag alone makes "which code is
+          # running" unanswerable after the fact.
+          docker tag openab-pty:candidate "$MOVING"
+          docker tag openab-pty:candidate "$IMMUTABLE"
+          docker push -q "$MOVING"
+          docker push -q "$IMMUTABLE"
+          echo "pushed $MOVING and $IMMUTABLE"
 
       - name: Summary
         if: github.event_name != 'pull_request'
