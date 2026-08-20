@@ -56,10 +56,11 @@ CI runs the same three on every PR, plus a matrix image build over every agent
 variant. A PR does not push images — the build runs to prove the base image and
 the musl link step still work.
 
-One known-flaky test:
-`killdomain::tests::tier1_reaches_a_tracked_escapee_through_the_pidfd_pass`. It is
-timing-sensitive under load. If that is your only failure, say so in the PR and we
-will rerun rather than send you chasing it.
+If a test fails on `ubuntu-24.04` but passes on `macos-14`, suspect a real
+platform difference before suspecting flakiness. The kill domain has a
+Linux-only pidfd path that the other target cannot exercise at all, and the one
+test previously written off as timing-sensitive turned out to be signalling
+unrelated host processes by pid on Linux. Say which target failed in the PR.
 
 ## Commits and PRs
 
