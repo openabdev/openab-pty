@@ -59,6 +59,20 @@ const DEFAULT_MAX_FILE_COUNT: usize = 10_000;
 /// Extract archive to a temp directory with budget enforcement, then move into target.
 /// Requires a gzipped tarball; other formats are rejected on magic bytes.
 /// Checks deadline cooperatively before each file operation.
+///
+/// **Not atomic, deliberately.** Extraction is staged in a temp directory, but the
+/// apply merges into a target that already has contents the caller must keep, and
+/// merging a tree into a populated directory cannot be atomic on POSIX — a
+/// whole-directory rename would discard exactly what we are preserving. So a
+/// failure part way through `move_recursive` leaves some entries applied and some
+/// not, and nothing rolls that back.
+///
+/// What bounds the consequence is the deployment rather than this function:
+/// seeding runs at startup, before the listener serves, and a failure here aborts
+/// startup. The workspace is an `emptyDir`, so the container exits, the pod is
+/// replaced, and the partial state is discarded with it. A deployment that seeds
+/// into persistent storage would not get that for free, and should treat a failed
+/// seed as "workspace state unknown" rather than "seed did nothing".
 pub fn extract_and_apply(data: &[u8], target: &Path, deadline: Instant) -> anyhow::Result<()> {
     std::fs::create_dir_all(target)?;
     let temp_dir = tempfile::tempdir_in(target)?;
@@ -100,8 +114,23 @@ fn extract_tarball_budgeted(
     max_extracted_bytes: u64,
 ) -> anyhow::Result<()> {
     use flate2::read::GzDecoder;
+    use std::io::Read;
 
-    let decoder = GzDecoder::new(data);
+    // The budget below is per entry and is consulted inside the loop, which is one
+    // step too late to cover everything: `Entries` consumes GNU longname ('L') and
+    // PAX ('x') pseudo-entries *itself*, reading their attacker-declared size to
+    // build the next real entry's path, before the loop body ever runs. Bounding
+    // the decompressed reader is the only place that covers work done inside the
+    // iterator, so a declared 500 MB longname cannot be read before anything checks
+    // it.
+    //
+    // Headroom on top of the byte budget covers legitimate metadata: a 512-byte
+    // header plus padding per entry, and genuine long paths. It is bounded by
+    // max_file_count, so it cannot itself become the bomb.
+    let metadata_headroom = (max_file_count as u64).saturating_mul(1024);
+    let ceiling = max_extracted_bytes.saturating_add(metadata_headroom);
+
+    let decoder = GzDecoder::new(data).take(ceiling);
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(false);
 
@@ -448,9 +477,9 @@ mod tests {
     /// Build a gzipped tar in memory from (path, contents) pairs.
     ///
     /// Upstream built these fixtures inline as zips. The properties the tests cover
-    /// -- atomic apply, deadline enforcement, byte and entry budgets -- are not
-    /// format-specific, so they are preserved against the one format this crate
-    /// reads rather than dropped with the zip path.
+    /// -- merging into a populated target, deadline enforcement, byte and entry
+    /// budgets -- are not format-specific, so they are preserved against the one
+    /// format this crate reads rather than dropped with the zip path.
     fn tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -467,8 +496,14 @@ mod tests {
 
     use super::*;
 
+    /// Named for what it checks: a seed merges into a target that already has
+    /// contents, without destroying them. It was called `extract_and_apply_atomic`,
+    /// which claimed a great deal more — it only ever drove the success path, and
+    /// the apply is not atomic (see `extract_and_apply`). A test asserting a
+    /// property it never exercises is worse than no test, because it answers the
+    /// question for anyone who greps for it.
     #[test]
-    fn extract_and_apply_atomic() {
+    fn extract_and_apply_merges_into_a_populated_target() {
         let target = tempfile::tempdir().unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
 
@@ -692,6 +727,91 @@ mod tests {
         assert!(
             !dst.join("sub").symlink_metadata().unwrap().is_symlink(),
             "the destination symlink should have been replaced by a real directory"
+        );
+    }
+
+    /// A GNU longname pseudo-entry is consumed by `Entries` before the caller sees
+    /// the real entry, so its declared size is read without passing the per-entry
+    /// budget. The reader ceiling is what bounds it. The fixture stays small because
+    /// a run of zeros compresses to almost nothing — which is exactly the shape of
+    /// the attack.
+    #[test]
+    fn an_oversized_longname_is_bounded_by_the_reader_ceiling() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let declared: u64 = 64 * 1024 * 1024;
+
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_size(declared);
+        header.set_mode(0o644);
+        let name = b"././@LongLink";
+        header.as_gnu_mut().expect("gnu header").name[..name.len()].copy_from_slice(name);
+        header.set_cksum();
+        builder
+            .append(&header, std::io::repeat(0u8).take(declared))
+            .unwrap();
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+
+        // The compressed fixture must be far smaller than what it declares, or the
+        // test is not exercising the asymmetry the attack depends on.
+        assert!(
+            (bytes.len() as u64) < declared / 100,
+            "fixture is not compressible enough to model the attack: {} vs {declared}",
+            bytes.len()
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        // Ceiling here is 1 MiB of payload plus metadata headroom for 4 entries,
+        // i.e. far below the 64 MiB the longname declares.
+        let err = extract_tarball_budgeted(&bytes, dir.path(), deadline, 4, 1024 * 1024)
+            .expect_err("a 64 MiB longname must not be read under a 1 MiB budget");
+        let msg = err.to_string();
+        // The two outcomes are distinguishable, and the distinction is the whole
+        // point. With the ceiling the reader truncates and tar reports an EOF while
+        // skipping the oversized member. Without it, tar reads all 64 MiB first and
+        // then complains that the longname described a member that never arrived
+        // ("members found describing a future member but no future member found") —
+        // i.e. it did the work the budget was supposed to prevent. Asserting on a
+        // third-party message is a little brittle, but it is the only signal that
+        // tells the two apart without measuring allocation.
+        assert!(
+            msg.contains("EOF"),
+            "expected the reader ceiling to truncate the oversized longname, but the \
+             archive was read far enough to fail some other way: {msg}"
+        );
+    }
+
+    /// The failure path the old `_atomic` name implied but never drove. A seed that
+    /// fails must surface the error rather than half-succeeding in silence, and must
+    /// not destroy what was already in the target. It is explicitly *not* asserted
+    /// that nothing was applied — the apply is a merge and is not rolled back.
+    #[test]
+    fn a_failed_apply_surfaces_the_error_and_keeps_existing_content() {
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("existing.txt"), "keep").unwrap();
+
+        let bytes = tgz(&[("a.txt", b"one"), ("b.txt", b"two")]);
+
+        // Already expired: move_recursive checks the deadline per entry, so the
+        // apply cannot complete.
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+        let err = extract_and_apply(&bytes, target.path(), expired)
+            .expect_err("an expired deadline must fail the apply");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout, got: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("existing.txt")).unwrap(),
+            "keep",
+            "a failed seed destroyed content that was already in the target"
         );
     }
 
