@@ -24,11 +24,11 @@
 //!    a `parking_lot` guard keeps that guard alive for the *whole* statement, so
 //!    a body that re-locks self-deadlocks against a non-reentrant mutex.
 //!
-//! DEFERRED to Gate B: splitting this file into modules. It is large, and the
-//! split is a real improvement — but the three rules above are file-local
-//! invariants that a split would have to re-state at every new boundary, and the
-//! crate is unpublished with one reader. Cutting dead code took it down first;
-//! the split waits until the module boundaries are load-bearing for somebody.
+//! DEFERRED: splitting this file into modules. It is large, and the split is a
+//! real improvement — but the three rules above are file-local invariants that a
+//! split would have to re-state at every new boundary. Cutting dead code took it
+//! down first; the split waits until the module boundaries are load-bearing
+//! rather than merely tidier.
 //!
 //! The I/O threads never take the state lock. They read the fence and activity
 //! clock from [`SessionIo`]'s atomics, which are written under the state lock —

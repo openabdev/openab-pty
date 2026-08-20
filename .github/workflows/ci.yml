@@ -49,11 +49,3 @@ jobs:
       # shutdown drain.
       - run: cargo test --locked -- --ignored --test-threads=1
       - run: cargo fmt --check
-
-  macos-client:
-    name: macos client
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: swift build -c release
-        working-directory: clients/macos

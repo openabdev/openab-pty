@@ -1,8 +1,7 @@
 //! `openab-pty` — remote sandboxed terminal sessions.
 //!
-//! Design of record: `docs/adr/openab-pty-runtime.md`. Phase 1 scope only, and
-//! internal/unpublished per the Gate A revision on the tracking issue: no image,
-//! no chart, no user docs, no web client.
+//! Design of record: `docs/adr/openab-pty-runtime.md` in `openabdev/openab`.
+//! Phase 1 scope: no chart and no web client.
 //!
 //! Two invariants from the ADR shape this crate and must not be quietly relaxed:
 //!

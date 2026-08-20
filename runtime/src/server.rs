@@ -447,7 +447,7 @@ impl UpgradeFailureLimiter {
 /// Listener-shaped settings, separated from [`crate::config::PtyConfig`] so tests
 /// can bind an ephemeral port without a projection on disk.
 ///
-/// DEFERRED to Gate B: promoting `drain_grace` and `tick_interval` to projection
+/// DEFERRED: promoting `drain_grace` and `tick_interval` to projection
 /// knobs. They are settable here because tests need them, and the withdrawn-knob
 /// pass deliberately left them out of the operator surface: every knob is a
 /// fail-closed validation rule plus a documented default, and no deployment has
@@ -524,9 +524,8 @@ impl AppState {
 // Router
 // ---------------------------------------------------------------------------
 
-/// DEFERRED to Gate B (publishing an image/chart/docs): `/healthz` and `/metrics`
-/// endpoints. Neither has a consumer while this crate is internal and unpublished
-/// — there is no chart to write a probe into and no scrape target — and liveness
+/// DEFERRED: `/healthz` and `/metrics` endpoints. Neither has a consumer yet —
+/// there is no chart to write a probe into and no scrape target — and liveness
 /// and counters are already observable through `GET /admin/sessions`. Adding a
 /// second unauthenticated surface on the listener a managed session can reach is
 /// not free, so it waits until something actually consumes it.

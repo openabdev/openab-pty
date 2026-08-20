@@ -65,9 +65,9 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    // DEFERRED to Gate B: a JSON logging layer. Nothing ingests these logs while
-    // the crate is internal and unpublished; `tracing`'s text output is what an
-    // operator reads with `kubectl logs`/`ecs execute-command` today, and the
+    // DEFERRED: a JSON logging layer. Nothing ingests these logs yet;
+    // `tracing`'s text output is what an operator reads with
+    // `kubectl logs`/`ecs execute-command` today, and the
     // audit trail — the part that must be machine-readable — is already
     // structured and serialised by `crate::audit`.
     tracing_subscriber::fmt()
