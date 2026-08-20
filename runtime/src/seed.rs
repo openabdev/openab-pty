@@ -308,6 +308,27 @@ fn move_recursive(src: &Path, dst: &Path, deadline: Instant) -> anyhow::Result<(
         let dst_path = dst.join(entry.file_name());
 
         let meta = src_path.symlink_metadata()?;
+
+        // A destination entry that is already a symlink is removed before anything
+        // is written through it. Without this, the directory branch below calls
+        // `create_dir_all` on a dst that is a symlink to somewhere else — which
+        // succeeds by *following* it — and then recurses, writing the seed outside
+        // the target. `copy` in the file fallback follows a dst symlink the same
+        // way. `rename` does not (it replaces the link itself), and the symlink
+        // branch already cleared dst, so this only closes the two paths that did
+        // not. The destination is the agent's own writable workspace, so planting
+        // that link is within reach of anything running in the container.
+        if let Ok(dst_meta) = dst_path.symlink_metadata() {
+            if dst_meta.is_symlink() {
+                warn!(
+                    "seed: replacing pre-existing symlink at destination rather than \
+                     writing through it: {}",
+                    dst_path.display()
+                );
+                std::fs::remove_file(&dst_path)?;
+            }
+        }
+
         if meta.is_symlink() {
             // Preserve symlinks as-is without following
             let link_target = std::fs::read_link(&src_path)?;
@@ -632,6 +653,45 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "secret",
             "an escaping entry overwrote a file outside dest"
+        );
+    }
+
+    /// A directory symlink already sitting in the destination must not be written
+    /// through. `create_dir_all` follows it and succeeds, so the recursion would
+    /// deposit the seed wherever the link points — reachable because the
+    /// destination is the agent's own writable workspace.
+    #[test]
+    fn a_destination_symlink_is_replaced_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(src.join("sub").join("payload.txt"), b"seed").unwrap();
+
+        // The trap: dst/sub is a symlink to a directory outside dst. Planted with
+        // the OS call, not this module's `create_symlink`, because that helper
+        // rejects absolute targets — a process squatting in the workspace has no
+        // such restraint.
+        std::os::unix::fs::symlink(&outside, dst.join("sub")).unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        move_recursive(&src, &dst, deadline).unwrap();
+
+        assert!(
+            !outside.join("payload.txt").exists(),
+            "seed was written through a destination symlink, outside the target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub").join("payload.txt")).unwrap(),
+            "seed",
+            "seed should land inside the destination"
+        );
+        assert!(
+            !dst.join("sub").symlink_metadata().unwrap().is_symlink(),
+            "the destination symlink should have been replaced by a real directory"
         );
     }
 
