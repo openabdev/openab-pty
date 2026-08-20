@@ -60,22 +60,30 @@ time and gets a "working as intended" reply:
 - **Anyone holding the admin credential controls every session.** That is what the
   credential is. Protecting it is the operator's job; the client keeps it in the
   system keychain.
-- **The admin failure throttle collapses to one bucket in the shipped topology.**
-  It is keyed on the peer IP, deliberately ignoring `X-Forwarded-For` because that
-  header is client-settable. But the tailnet sidecar proxies to loopback, so every
-  caller arrives as `127.0.0.1` and shares a single bucket. Anyone who can reach
-  the pod's tailnet address can therefore hold that bucket at its ceiling with
-  unauthenticated requests and keep the real operator receiving `429`. It is
-  bounded rather than permanent — 100 ms doubling to a 5 s cap, forgotten after
-  60 s — and it grants no access, so it is a nuisance rather than an escalation.
-  Scoping who can reach the tailnet address is a tailnet ACL question. Report a
-  way to make the block *permanent*, or to trigger it as an authenticated caller.
-- **Probes must carry the credential.** A consequence of the above: an
-  unauthenticated poller — a liveness probe, a "is it up yet" loop — throttles the
-  shared bucket before a real request arrives. An authenticated probe consumes no
-  failure budget. A client testing whether the admin plane refuses correctly must
-  treat `401` **and** `429` as a refusal; only a `200` without a credential is a
-  finding.
+- **Both throttles collapse to one bucket in the shipped topology.** They are keyed
+  on the peer IP, deliberately ignoring `X-Forwarded-For` because that header is
+  client-settable. But the tailnet sidecar proxies to loopback, so every caller
+  arrives as `127.0.0.1` and shares a single bucket. The two planes then behave
+  very differently, and only one of them matters:
+  - **Admin plane: the operator is not lockable.** `verify` hashes and compares in
+    constant time *before* consulting the block, and a success clears that
+    source's bucket. A correct credential is therefore never refused by the
+    throttle, however hard someone else is hammering the endpoint. A path on which
+    a *correct* credential is refused is a vulnerability — report it.
+  - **Attach plane: a valid token can be refused.** The upgrade limiter runs
+    before the token is read, so a ban rejects everyone, including a caller
+    holding a valid attach token. Five failures in 60 s earns a 60 s ban, and
+    because the bucket is shared, anyone who can reach the tailnet address can
+    trigger it — **including a session shell, over loopback**. That does not
+    breach invariant 1: the shell still cannot authenticate to or invoke an admin
+    operation, and it cannot manage its siblings. It can make attaching
+    unavailable for 60 s at a time. Bounded, grants nothing, documented here
+    rather than fixed. Report a way to make it *permanent*.
+- **Probes must carry the credential.** An unauthenticated poller — a liveness
+  probe, a "is it up yet" loop — moves the shared admin bucket, so a client
+  testing whether the admin plane refuses correctly must treat `401` **and** `429`
+  as a refusal; only a `200` without a credential is a finding. An authenticated
+  probe consumes no failure budget at all.
 - **The tailnet is trusted.** Anything on your tailnet can reach the sidecar.
   Scoping that is a tailnet ACL question, not a runtime one.
 - **Third-party agent CLIs inside the published images.** Every variant except
