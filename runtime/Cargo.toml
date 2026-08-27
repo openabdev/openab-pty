@@ -28,7 +28,7 @@ clap = { version = "4", features = ["derive"] }
 subtle = "2"
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.8"
+rand = "0.9"
 portable-pty = "0.9"
 # Seeded-state extraction. No `zip`: see the deviations noted in runtime/src/seed.rs.
 tar = "0.4"
