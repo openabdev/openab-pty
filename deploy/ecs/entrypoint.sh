@@ -35,6 +35,12 @@ for var in PTY_MAX_SESSIONS PTY_SCROLLBACK_KIB; do
     [[ ${!var:-} =~ ^[0-9]+$ ]] || die "$var must be a bare non-negative integer, got: ${!var:-}"
 done
 
+PTY_FILTER_TERMINAL_RESPONSES="${PTY_FILTER_TERMINAL_RESPONSES:-true}"
+case "$PTY_FILTER_TERMINAL_RESPONSES" in
+    true|false) : ;;
+    *) die "PTY_FILTER_TERMINAL_RESPONSES must be true or false, got: $PTY_FILTER_TERMINAL_RESPONSES" ;;
+esac
+
 case ${PTY_ADMIN_HASH} in
     sha256:*) : ;;
     *) die "PTY_ADMIN_HASH must start with sha256: (length ${#PTY_ADMIN_HASH})" ;;
@@ -62,6 +68,7 @@ detached_idle_ttl = "${PTY_IDLE_TTL}"
 attach_token_ttl = "${PTY_TOKEN_TTL}"
 scrollback_kib = ${PTY_SCROLLBACK_KIB}
 scrollback_replay = false
+filter_terminal_responses = ${PTY_FILTER_TERMINAL_RESPONSES}
 admin_credential_hash = "${PTY_ADMIN_HASH}"
 seed_dir = "${PTY_SEED_DIR:-}"
 EOF

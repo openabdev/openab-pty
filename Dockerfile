@@ -101,6 +101,7 @@ ENV HOME=/workspace \
     PTY_IDLE_TTL=8h \
     PTY_TOKEN_TTL=12h \
     PTY_SCROLLBACK_KIB=1024 \
+    PTY_FILTER_TERMINAL_RESPONSES=true \
     # Empty means no seeding, which is what every deployment did before this
     # existed. A deployment opts in by pointing this at a directory another
     # container has filled with *.tar.gz; this image fetches nothing itself.
