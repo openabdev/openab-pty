@@ -153,11 +153,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         detached_idle_ttl: duration_with_default(pty, "detached_idle_ttl", "30m")?,
         scrollback_kib: usize_with_default(pty, "scrollback_kib", 1024)?,
         scrollback_replay: bool_with_default(pty, "scrollback_replay", false)?,
-        filter_terminal_responses: bool_with_default(
-            pty,
-            "filter_terminal_responses",
-            true,
-        )?,
+        filter_terminal_responses: bool_with_default(pty, "filter_terminal_responses", true)?,
         admin_credential_hash: raw_hash,
         seed_dir: string_with_default(pty, "seed_dir", "")?.to_string(),
         kill_domain_requirement: parse_kill_domain(string_with_default(
@@ -416,8 +412,10 @@ admin_credential_hash = "{HASH}"
         let config = validate_projection(&valid()).unwrap();
         assert_eq!(config.max_sessions, 4);
         assert_eq!(config.detached_idle_ttl, Duration::from_secs(30 * 60));
-        assert!(config.filter_terminal_responses,
-                "omitted config must preserve the existing safe default");
+        assert!(
+            config.filter_terminal_responses,
+            "omitted config must preserve the existing safe default"
+        );
         assert_eq!(
             config.kill_domain_requirement,
             KillDomainRequirement::Tier1Allowed
@@ -426,11 +424,9 @@ admin_credential_hash = "{HASH}"
 
     #[test]
     fn terminal_response_filter_can_be_explicitly_disabled() {
-        let config = validate_projection(&format!(
-            "{}filter_terminal_responses = false\n",
-            valid()
-        ))
-        .expect("Devin deployments need terminal capability replies");
+        let config =
+            validate_projection(&format!("{}filter_terminal_responses = false\n", valid()))
+                .expect("Devin deployments need terminal capability replies");
         assert!(!config.filter_terminal_responses);
     }
 
@@ -441,7 +437,10 @@ admin_credential_hash = "{HASH}"
             valid()
         ))
         .expect_err("a quoted boolean must fail closed");
-        assert!(error.to_string().contains("filter_terminal_responses"), "{error}");
+        assert!(
+            error.to_string().contains("filter_terminal_responses"),
+            "{error}"
+        );
     }
 
     #[test]
