@@ -138,11 +138,11 @@ need to answer "which code is running" after the fact.
 The nightly channel exists because the release channels ship whatever CLI version
 the openab base was built with — a daily rebuild alone would republish the same
 CLI every day. Nightly images overwrite the agent CLI with the version the vendor
-published most recently, and each day also gets an immutable
-`nightly-YYYYMMDD-<variant>` as the rollback point. Variants publish
+published most recently, and each successful run also gets an immutable
+`nightly-YYYYMMDD-<run-id>-<variant>` as the rollback point. Variants publish
 independently: one vendor breaking their latest does not hold back the rest.
-Currently built for `claude`, `codex`, and `kiro`; the rest of the matrix follows
-(#12).
+Every agent-CLI variant is covered; `native` is omitted because it has no CLI to
+update by definition (#12).
 
 The `native` variant carries no agent CLI, and is the only one whose contents are
 covered entirely by MIT-licensed code — see [`NOTICE`](NOTICE).

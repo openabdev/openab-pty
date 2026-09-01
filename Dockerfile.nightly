@@ -59,19 +59,50 @@ FROM ghcr.io/openabdev/openab@${OPENAB_BASE_DIGEST}
 USER root
 
 ARG VARIANT
-# For npm-sourced CLIs this is the version the workflow resolved from the
-# registry this morning, and the smoke test asserts the installed CLI reports
-# exactly it. For kiro the vendor publishes a `latest` URL instead of a queryable
-# version index, so the workflow passes "latest" and learns the version from the
-# built image afterwards.
+# For npm- and manifest-sourced CLIs this is the version the workflow resolved
+# this morning, and the smoke test asserts the installed CLI reports exactly it.
+# For kiro the vendor publishes a `latest` URL instead of a queryable version
+# index, so the workflow passes "latest" and learns the version from the built
+# image afterwards. Devin's manifest also carries a sha256, which the workflow
+# passes through CLI_SHA256 so the download is verified; the other vendors
+# publish no checksum for their latest — that is the nightly trade, and the
+# dated immutable tags are the rollback path.
 ARG CLI_VERSION
+ARG CLI_SHA256=""
 RUN set -eux; \
     case "${VARIANT}" in \
       claude) \
-        npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}" --retry 3 \
+        npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}" --fetch-retries=3 \
         && npm cache clean --force ;; \
       codex) \
         npm install -g "@openai/codex@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      copilot) \
+        npm install -g "@github/copilot@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      gemini) \
+        npm install -g "@google/gemini-cli@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      opencode) \
+        npm install -g "opencode-ai@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      hermes) \
+        curl -fsSL --retry 3 --retry-delay 5 \
+          "https://raw.githubusercontent.com/NousResearch/hermes-agent/${CLI_VERSION}/scripts/install.sh" \
+          -o /tmp/install-hermes.sh \
+        && rm -rf /usr/local/lib/hermes-agent \
+        && HERMES_HOME=/home/agent/.hermes \
+           HERMES_INSTALL_DIR=/usr/local/lib/hermes-agent \
+           bash /tmp/install-hermes.sh --skip-setup --skip-browser \
+             --skip-computer-use --no-skills --branch "${CLI_VERSION}" \
+        && rm /tmp/install-hermes.sh \
+        && ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp \
+        && chown -R 1000:1000 /home/agent ;; \
+      mimocode) \
+        npm install -g "@mimo-ai/cli@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      pi) \
+        npm install -g "@earendil-works/pi-coding-agent@${CLI_VERSION}" --fetch-retries=3 \
         && npm cache clean --force ;; \
       kiro) \
         curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 5 \
@@ -81,6 +112,37 @@ RUN set -eux; \
         && cp /tmp/kirocli/bin/* /usr/local/bin/ \
         && chmod +x /usr/local/bin/kiro-cli* \
         && rm -rf /tmp/kirocli /tmp/kirocli.zip ;; \
+      antigravity) \
+        curl -fsSL --retry 3 --retry-delay 5 \
+          "https://github.com/google-antigravity/antigravity-cli/releases/download/${CLI_VERSION}/agy_cli_linux_x64.tar.gz" \
+          -o /tmp/agy.tar.gz \
+        && tar -xzf /tmp/agy.tar.gz -C /usr/local/bin \
+        && rm /tmp/agy.tar.gz \
+        && mv -f /usr/local/bin/antigravity /usr/local/bin/agy \
+        && chmod +x /usr/local/bin/agy ;; \
+      cursor) \
+        curl -fSL --retry 3 --retry-delay 5 \
+          "https://downloads.cursor.com/lab/${CLI_VERSION}/linux/x64/agent-cli-package.tar.gz" \
+          -o /tmp/cursor.tar.gz \
+        && rm -rf /opt/cursor-agent /opt/dist-package \
+        && tar xzf /tmp/cursor.tar.gz -C /opt \
+        && mv /opt/dist-package /opt/cursor-agent \
+        && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent \
+        && rm /tmp/cursor.tar.gz ;; \
+      devin) \
+        curl -fsSL --retry 3 --retry-delay 5 \
+          "https://static.devin.ai/cli/${CLI_VERSION}/devin-${CLI_VERSION}-x86_64-unknown-linux.tar.gz" \
+          -o /tmp/devin.tar.gz \
+        && echo "${CLI_SHA256}  /tmp/devin.tar.gz" | sha256sum -c - \
+        && tar xzf /tmp/devin.tar.gz -C /tmp \
+        && install -m 0755 /tmp/bin/devin /usr/local/bin/devin \
+        && rm -rf /tmp/devin* /tmp/bin /tmp/share ;; \
+      grok) \
+        curl -fsSL --retry 3 --retry-delay 5 \
+          "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${CLI_VERSION}-linux-x86_64" \
+          -o /tmp/grok \
+        && install -m 0755 /tmp/grok /usr/local/bin/grok \
+        && rm /tmp/grok ;; \
       *) echo "unknown nightly variant: ${VARIANT}" >&2; exit 1 ;; \
     esac
 
