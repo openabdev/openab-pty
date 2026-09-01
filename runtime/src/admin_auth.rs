@@ -20,7 +20,7 @@ use crate::audit::{hash_fingerprint, AuditEvent, AuditKind, AuditLogger};
 use crate::containment::SecretBytes;
 use crate::Error;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -124,7 +124,9 @@ impl AdminAuthenticator {
     /// this value; only its non-reversible verifier belongs in container config.
     pub fn generate() -> GeneratedAdminCredential {
         let mut raw = [0u8; 32];
-        OsRng.fill_bytes(&mut raw);
+        OsRng
+            .try_fill_bytes(&mut raw)
+            .expect("OS RNG failed while generating admin bootstrap credential");
         let mut encoded = Vec::with_capacity(64);
         for byte in raw {
             encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
