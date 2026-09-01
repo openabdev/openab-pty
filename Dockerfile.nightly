@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # openab-pty — nightly channel. See .github/workflows/nightly-images.yml and
 # issue #12.
 #
@@ -42,6 +44,13 @@ RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked --target x86_64-unknown-linux-musl \
     && strip target/x86_64-unknown-linux-musl/release/openab-pty
 
+# The workflow fetches the Hermes installer through GitHub's authenticated
+# Contents API at the exact resolved release commit. Keeping it in a scratch
+# stage lets the runtime RUN mount it without adding the script to any final
+# image layer. Non-Hermes matrix jobs provide a fail-closed placeholder.
+FROM scratch AS hermes-installer
+COPY --chmod=755 .nightly-hermes-install.sh /install.sh
+
 # --- runtime ----------------------------------------------------------------
 # The openab base, digest-pinned per variant by the workflow at build time — the
 # digest is recorded in the job log so a base change can never silently alter an
@@ -69,7 +78,10 @@ ARG VARIANT
 # dated immutable tags are the rollback path.
 ARG CLI_VERSION
 ARG CLI_SHA256=""
-RUN set -eux; \
+ARG CLI_REF=""
+RUN --mount=type=bind,from=hermes-installer,source=/install.sh,target=/tmp/install-hermes.sh,ro \
+    set -eux; \
+\
     case "${VARIANT}" in \
       claude) \
         npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}" --fetch-retries=3 \
@@ -87,15 +99,12 @@ RUN set -eux; \
         npm install -g "opencode-ai@${CLI_VERSION}" --fetch-retries=3 \
         && npm cache clean --force ;; \
       hermes) \
-        curl -fsSL --retry 3 --retry-delay 5 \
-          "https://raw.githubusercontent.com/NousResearch/hermes-agent/${CLI_VERSION}/scripts/install.sh" \
-          -o /tmp/install-hermes.sh \
-        && rm -rf /usr/local/lib/hermes-agent \
+        rm -rf /usr/local/lib/hermes-agent \
         && HERMES_HOME=/home/agent/.hermes \
            HERMES_INSTALL_DIR=/usr/local/lib/hermes-agent \
            bash /tmp/install-hermes.sh --skip-setup --skip-browser \
-             --skip-computer-use --no-skills --branch "${CLI_VERSION}" \
-        && rm /tmp/install-hermes.sh \
+             --skip-computer-use --no-skills --branch main \
+             --commit "${CLI_REF}" --force-commit \
         && ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp \
         && chown -R 1000:1000 /home/agent ;; \
       mimocode) \
