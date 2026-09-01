@@ -1,0 +1,281 @@
+name: nightly images
+
+# Daily builds carrying the *latest* coding CLI for each variant — issue #12.
+#
+# The release channels cannot do this: the CLI version is an ARG pinned inside
+# the openab base's own Dockerfile, so rebuilding FROM that base republishes the
+# same CLI however often it runs. This lane starts from the same base (pulled,
+# never modified — nothing here pushes, retags or deletes anything under
+# ghcr.io/openabdev/openab) and overwrites the agent CLI with the version the
+# vendor published most recently.
+#
+# Channel contract, deliberately different from image.yml:
+#   - freshness over cohort atomicity: each variant publishes independently, so
+#     one vendor breaking their latest does not hold back the rest. A failed
+#     variant keeps yesterday's tag; the red job is the alert.
+#   - nightly-<variant> is the moving tag; the
+#     nightly-YYYYMMDD-<run-id>-<variant> tag is the immutable rollback point.
+#   - pre-beta-* / beta-* and their build path are untouched.
+#
+# Every agent-CLI variant is covered. `native` is intentionally absent because
+# it carries no coding CLI by definition, so there is nothing to update.
+
+on:
+  schedule:
+    # Off-peak, and offset from the hour to dodge the scheduler rush.
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Dockerfile.nightly
+      - .github/workflows/nightly-images.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-images
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: openabdev/openab-pty
+
+jobs:
+  # Same gate as image.yml, same reason: the image is built from whatever the
+  # tests ran against. main was green at push time, but this runs up to a day
+  # later on a runner image that has moved — re-proving is cheap, debugging a
+  # published artifact is not.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: ci
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every agent-CLI variant. `native` is the sole exclusion: by
+        # definition it carries no agent CLI, so there is nothing to freshen.
+        variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
+                  grok, hermes, kiro, mimocode, opencode, pi]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve the latest CLI version and the base digest
+        id: meta
+        run: |
+          set -euo pipefail
+
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+          # The vendor's latest, resolved fresh each morning. Each mechanism
+          # below was verified against the live endpoint before being wired in:
+          #   npm registry /latest document ....... claude codex copilot gemini
+          #                                         opencode mimocode pi
+          #   GitHub releases/latest .............. antigravity hermes
+          #   install script's embedded version ... cursor
+          #   cli/current/manifest.json ........... devin (also carries sha256)
+          #   GCS channel version file ............ grok
+          #   vendor `latest` download URL ........ kiro (version learned from
+          #                                         the built image afterwards)
+          CLI_SHA256=""
+          case "${{ matrix.variant }}" in
+            claude)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r .version) ;;
+            codex)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@openai/codex/latest | jq -r .version) ;;
+            copilot)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@github/copilot/latest | jq -r .version) ;;
+            gemini)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@google/gemini-cli/latest | jq -r .version) ;;
+            opencode)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/opencode-ai/latest | jq -r .version) ;;
+            mimocode)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@mimo-ai/cli/latest | jq -r .version) ;;
+            pi)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@earendil-works/pi-coding-agent/latest | jq -r .version) ;;
+            antigravity)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name) ;;
+            hermes)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://api.github.com/repos/NousResearch/hermes-agent/releases/latest | jq -r .tag_name) ;;
+            cursor)
+              # The install script embeds the version it would install; there is
+              # no separate version index. Anchored to the download URL shape so
+              # an unrelated mention of the domain cannot match.
+              CLI_VERSION=$(curl -fsSL --retry 3 https://cursor.com/install \
+                | grep -oE 'downloads\.cursor\.com/lab/[^/]+/' | head -1 \
+                | sed 's|downloads.cursor.com/lab/||; s|/$||') ;;
+            devin)
+              MANIFEST=$(curl -fsSL --retry 3 https://static.devin.ai/cli/current/manifest.json)
+              CLI_VERSION=$(echo "$MANIFEST" | jq -r .version)
+              CLI_SHA256=$(echo "$MANIFEST" | jq -r '.platforms["x86_64-unknown-linux"].sha256') ;;
+            grok)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d '[:space:]') ;;
+            kiro)
+              CLI_VERSION=latest ;;
+          esac
+          [ -n "$CLI_VERSION" ] && [ "$CLI_VERSION" != "null" ] || {
+            echo "FAIL: could not resolve latest CLI version for ${{ matrix.variant }}" >&2
+            exit 1
+          }
+          echo "cli_version=$CLI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cli_sha256=$CLI_SHA256" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${{ matrix.variant }} CLI -> $CLI_VERSION"
+
+          # The base is the same pre-beta variant the release channel builds
+          # from, digest-pinned at build time and recorded here so the log
+          # answers "what base was under this nightly" after the fact.
+          T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
+          DIGEST=$(curl -s -H "Authorization: Bearer $T" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/openabdev/openab/manifests/pre-beta-${{ matrix.variant }}" \
+            | jq -r '.manifests[]|select(.platform.architecture=="amd64").digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "FAIL: could not resolve digest for pre-beta-${{ matrix.variant }}" >&2
+            exit 1
+          fi
+          echo "base_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Resolved pre-beta-${{ matrix.variant }} -> $DIGEST"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Built into the local daemon, not pushed — the smoke test is the gate,
+      # and it is only a gate if nothing is public before it runs.
+      - name: Build into the local daemon
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.nightly
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: openab-pty:nightly-candidate
+          build-args: |
+            OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
+            VARIANT=${{ matrix.variant }}
+            CLI_VERSION=${{ steps.meta.outputs.cli_version }}
+            CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
+          cache-from: type=gha,scope=nightly-${{ matrix.variant }}
+          cache-to: type=gha,scope=nightly-${{ matrix.variant }},mode=max
+          provenance: false
+
+      # The image.yml contract checks, plus the one this channel exists for:
+      # the CLI inside must be the version resolved this morning.
+      - name: Smoke test the candidate image
+        env:
+          IMAGE: openab-pty:nightly-candidate
+          CLI_VERSION: ${{ steps.meta.outputs.cli_version }}
+        run: |
+          set -euo pipefail
+
+          # 1. Refuses to start without an admin credential hash.
+          if docker run --rm "$IMAGE" --version >/dev/null 2>&1; then
+            echo "FAIL: started with no PTY_ADMIN_HASH" >&2; exit 1
+          fi
+          echo "ok: refuses to start without PTY_ADMIN_HASH"
+
+          CRED="$(openssl rand -hex 32)"
+          HASH="sha256:$(printf '%s' "$CRED" | sha256sum | cut -d' ' -f1)"
+
+          # 2. Refuses an off-loopback bind with no TLS terminator.
+          if docker run --rm -e PTY_ADMIN_HASH="$HASH" -e PTY_LISTEN=0.0.0.0:8090 \
+               "$IMAGE" >/dev/null 2>&1; then
+            echo "FAIL: bound off-loopback with no TLS terminator" >&2; exit 1
+          fi
+          echo "ok: fail-closed listener guard holds"
+
+          docker run -d --name pty --read-only --tmpfs /tmp \
+            --tmpfs /workspace:rw,exec,uid=1000,gid=1000,mode=1777 \
+            -e PTY_ADMIN_HASH="$HASH" "$IMAGE" >/dev/null
+          for _ in $(seq 1 20); do
+            docker exec pty curl -sf -o /dev/null --max-time 2 \
+              -H "Authorization: Bearer $CRED" http://127.0.0.1:8090/admin/sessions && break
+            sleep 1
+          done
+
+          # 3. Admin plane answers the credential and refuses its absence.
+          docker exec pty curl -sf --max-time 5 -H "Authorization: Bearer $CRED" \
+            http://127.0.0.1:8090/admin/sessions >/dev/null
+          echo "ok: admin plane authenticates"
+          CODE="$(docker exec pty curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            http://127.0.0.1:8090/admin/sessions)"
+          [ "$CODE" = "401" ] || { echo "FAIL: unauthenticated admin got $CODE, expected 401" >&2; exit 1; }
+          echo "ok: unauthenticated admin request gets 401"
+
+          # 4. Sandbox properties hold.
+          docker exec pty sh -c '[ "$(id -u)" = 1000 ]' || { echo "FAIL: not uid 1000" >&2; exit 1; }
+          docker exec pty sh -c '! command -v sudo >/dev/null' || { echo "FAIL: sudo present" >&2; exit 1; }
+          docker exec pty sh -c '! touch /probe 2>/dev/null' || { echo "FAIL: root filesystem writable" >&2; exit 1; }
+          echo "ok: uid 1000, no sudo, read-only root filesystem"
+
+          # 5. The channel's promise: the CLI is the latest, and it runs.
+          case "${{ matrix.variant }}" in
+            antigravity) GOT="$(docker exec pty agy --version)" ;;
+            claude)      GOT="$(docker exec pty claude --version)" ;;
+            codex)       GOT="$(docker exec pty codex --version)" ;;
+            copilot)     GOT="$(docker exec pty copilot --version)" ;;
+            cursor)      GOT="$(docker exec pty cursor-agent --version)" ;;
+            devin)       GOT="$(docker exec pty devin --version)" ;;
+            gemini)      GOT="$(docker exec pty gemini --version)" ;;
+            grok)        GOT="$(docker exec pty grok --version)" ;;
+            hermes)      GOT="$(docker exec pty git -c safe.directory=/usr/local/lib/hermes-agent -C /usr/local/lib/hermes-agent describe --tags --exact-match) ($(docker exec pty hermes-acp --version))" ;;
+            kiro)        GOT="$(docker exec pty kiro-cli --version)" ;;
+            mimocode)    GOT="$(docker exec pty mimo --version)" ;;
+            opencode)    GOT="$(docker exec pty opencode --version)" ;;
+            pi)          GOT="$(docker exec pty pi --version)" ;;
+          esac
+          echo "installed CLI reports: $GOT"
+          if [ "$CLI_VERSION" != "latest" ]; then
+            case "$GOT" in
+              *"$CLI_VERSION"*) echo "ok: CLI is the resolved latest ($CLI_VERSION)" ;;
+              *) echo "FAIL: expected CLI $CLI_VERSION, image reports: $GOT" >&2; exit 1 ;;
+            esac
+          fi
+          # Recorded for the summary — for kiro this is where the version is
+          # learned, since the vendor's latest URL carries no version index.
+          echo "$GOT" > /tmp/cli-version-report
+
+          docker rm -f pty >/dev/null
+
+      # Retag the exact bytes that passed; never rebuild between test and push.
+      - name: Push the image that passed
+        if: github.event_name != 'pull_request'
+        env:
+          MOVING: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
+          IMMUTABLE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          docker tag openab-pty:nightly-candidate "$MOVING"
+          docker tag openab-pty:nightly-candidate "$IMMUTABLE"
+          docker push -q "$MOVING"
+          docker push -q "$IMMUTABLE"
+          echo "pushed $MOVING and $IMMUTABLE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Nightly image pushed"
+            echo
+            echo '```'
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}"
+            echo '```'
+            echo
+            echo "CLI: $(cat /tmp/cli-version-report 2>/dev/null || echo 'n/a')"
+            echo
+            echo "Base: openab:pre-beta-${{ matrix.variant }} @ ${{ steps.meta.outputs.base_digest }} (consumed, never modified)"
+            echo
+            echo "The image aggregates a third-party agent CLI (the vendor's latest) under its vendor's terms; MIT covers this repository only. See NOTICE."
+          } >> "$GITHUB_STEP_SUMMARY"
