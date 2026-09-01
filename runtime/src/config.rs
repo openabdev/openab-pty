@@ -99,8 +99,7 @@ const PTY_KEYS: &[&str] = &[
 /// is linked or invoked here. `admin_credential_hash` is stricter: it is literal
 /// only, so an unset or poisoned env expression can never disable admin auth.
 pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
-    let mut root: Value = input
-        .parse::<Value>()
+    let mut root: Value = toml::from_str(input)
         .map_err(|error| Error::Config(format!("invalid TOML projection: {error}")))?;
     reject_unsafe_values(&root)?;
 
