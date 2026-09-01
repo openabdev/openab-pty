@@ -1,0 +1,225 @@
+name: nightly images
+
+# Daily builds carrying the *latest* coding CLI for each variant — issue #12.
+#
+# The release channels cannot do this: the CLI version is an ARG pinned inside
+# the openab base's own Dockerfile, so rebuilding FROM that base republishes the
+# same CLI however often it runs. This lane starts from the same base (pulled,
+# never modified — nothing here pushes, retags or deletes anything under
+# ghcr.io/openabdev/openab) and overwrites the agent CLI with the version the
+# vendor published most recently.
+#
+# Channel contract, deliberately different from image.yml:
+#   - freshness over cohort atomicity: each variant publishes independently, so
+#     one vendor breaking their latest does not hold back the rest. A failed
+#     variant keeps yesterday's tag; the red job is the alert.
+#   - nightly-<variant> is the moving tag; nightly-YYYYMMDD-<variant> is the
+#     immutable rollback point.
+#   - pre-beta-* / beta-* and their build path are untouched.
+#
+# Phase 1 (this file): claude, codex, kiro. The rest of the matrix follows once
+# this loop has run green for a week — tracked in issue #12.
+
+on:
+  schedule:
+    # Off-peak, and offset from the hour to dodge the scheduler rush.
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-images
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: openabdev/openab-pty
+
+jobs:
+  # Same gate as image.yml, same reason: the image is built from whatever the
+  # tests ran against. main was green at push time, but this runs up to a day
+  # later on a runner image that has moved — re-proving is cheap, debugging a
+  # published artifact is not.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: ci
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [claude, codex, kiro]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve the latest CLI version and the base digest
+        id: meta
+        run: |
+          set -euo pipefail
+
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+          # The vendor's latest, resolved fresh each morning. npm's registry
+          # serves a /latest document; kiro publishes a `latest` download URL
+          # instead of a queryable index, so its version is learned from the
+          # built image in the smoke test rather than resolved here.
+          case "${{ matrix.variant }}" in
+            claude)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r .version) ;;
+            codex)
+              CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@openai/codex/latest | jq -r .version) ;;
+            kiro)
+              CLI_VERSION=latest ;;
+          esac
+          [ -n "$CLI_VERSION" ] && [ "$CLI_VERSION" != "null" ] || {
+            echo "FAIL: could not resolve latest CLI version for ${{ matrix.variant }}" >&2
+            exit 1
+          }
+          echo "cli_version=$CLI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${{ matrix.variant }} CLI -> $CLI_VERSION"
+
+          # The base is the same pre-beta variant the release channel builds
+          # from, digest-pinned at build time and recorded here so the log
+          # answers "what base was under this nightly" after the fact.
+          T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
+          DIGEST=$(curl -s -H "Authorization: Bearer $T" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/openabdev/openab/manifests/pre-beta-${{ matrix.variant }}" \
+            | jq -r '.manifests[]|select(.platform.architecture=="amd64").digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "FAIL: could not resolve digest for pre-beta-${{ matrix.variant }}" >&2
+            exit 1
+          fi
+          echo "base_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Resolved pre-beta-${{ matrix.variant }} -> $DIGEST"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Built into the local daemon, not pushed — the smoke test is the gate,
+      # and it is only a gate if nothing is public before it runs.
+      - name: Build into the local daemon
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.nightly
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: openab-pty:nightly-candidate
+          build-args: |
+            OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
+            VARIANT=${{ matrix.variant }}
+            CLI_VERSION=${{ steps.meta.outputs.cli_version }}
+          cache-from: type=gha,scope=nightly-${{ matrix.variant }}
+          cache-to: type=gha,scope=nightly-${{ matrix.variant }},mode=max
+          provenance: false
+
+      # The image.yml contract checks, plus the one this channel exists for:
+      # the CLI inside must be the version resolved this morning.
+      - name: Smoke test the candidate image
+        env:
+          IMAGE: openab-pty:nightly-candidate
+          CLI_VERSION: ${{ steps.meta.outputs.cli_version }}
+        run: |
+          set -euo pipefail
+
+          # 1. Refuses to start without an admin credential hash.
+          if docker run --rm "$IMAGE" --version >/dev/null 2>&1; then
+            echo "FAIL: started with no PTY_ADMIN_HASH" >&2; exit 1
+          fi
+          echo "ok: refuses to start without PTY_ADMIN_HASH"
+
+          CRED="$(openssl rand -hex 32)"
+          HASH="sha256:$(printf '%s' "$CRED" | sha256sum | cut -d' ' -f1)"
+
+          # 2. Refuses an off-loopback bind with no TLS terminator.
+          if docker run --rm -e PTY_ADMIN_HASH="$HASH" -e PTY_LISTEN=0.0.0.0:8090 \
+               "$IMAGE" >/dev/null 2>&1; then
+            echo "FAIL: bound off-loopback with no TLS terminator" >&2; exit 1
+          fi
+          echo "ok: fail-closed listener guard holds"
+
+          docker run -d --name pty --read-only --tmpfs /tmp --tmpfs /workspace \
+            -e PTY_ADMIN_HASH="$HASH" "$IMAGE" >/dev/null
+          for i in $(seq 1 20); do
+            docker exec pty curl -sf -o /dev/null --max-time 2 \
+              -H "Authorization: Bearer $CRED" http://127.0.0.1:8090/admin/sessions && break
+            sleep 1
+          done
+
+          # 3. Admin plane answers the credential and refuses its absence.
+          docker exec pty curl -sf --max-time 5 -H "Authorization: Bearer $CRED" \
+            http://127.0.0.1:8090/admin/sessions >/dev/null
+          echo "ok: admin plane authenticates"
+          CODE="$(docker exec pty curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            http://127.0.0.1:8090/admin/sessions)"
+          [ "$CODE" = "401" ] || { echo "FAIL: unauthenticated admin got $CODE, expected 401" >&2; exit 1; }
+          echo "ok: unauthenticated admin request gets 401"
+
+          # 4. Sandbox properties hold.
+          docker exec pty sh -c '[ "$(id -u)" = 1000 ]' || { echo "FAIL: not uid 1000" >&2; exit 1; }
+          docker exec pty sh -c '! command -v sudo >/dev/null' || { echo "FAIL: sudo present" >&2; exit 1; }
+          docker exec pty sh -c '! touch /probe 2>/dev/null' || { echo "FAIL: root filesystem writable" >&2; exit 1; }
+          echo "ok: uid 1000, no sudo, read-only root filesystem"
+
+          # 5. The channel's promise: the CLI is the latest, and it runs.
+          case "${{ matrix.variant }}" in
+            claude)  GOT="$(docker exec pty claude --version)" ;;
+            codex)   GOT="$(docker exec pty codex --version)" ;;
+            kiro)    GOT="$(docker exec pty kiro-cli --version)" ;;
+          esac
+          echo "installed CLI reports: $GOT"
+          if [ "$CLI_VERSION" != "latest" ]; then
+            case "$GOT" in
+              *"$CLI_VERSION"*) echo "ok: CLI is the resolved latest ($CLI_VERSION)" ;;
+              *) echo "FAIL: expected CLI $CLI_VERSION, image reports: $GOT" >&2; exit 1 ;;
+            esac
+          fi
+          # Recorded for the summary — for kiro this is where the version is
+          # learned, since the vendor's latest URL carries no version index.
+          echo "$GOT" > /tmp/cli-version-report
+
+          docker rm -f pty >/dev/null
+
+      # Retag the exact bytes that passed; never rebuild between test and push.
+      - name: Push the image that passed
+        env:
+          MOVING: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
+          IMMUTABLE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          docker tag openab-pty:nightly-candidate "$MOVING"
+          docker tag openab-pty:nightly-candidate "$IMMUTABLE"
+          docker push -q "$MOVING"
+          docker push -q "$IMMUTABLE"
+          echo "pushed $MOVING and $IMMUTABLE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Nightly image pushed"
+            echo
+            echo '```'
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ matrix.variant }}"
+            echo '```'
+            echo
+            echo "CLI: $(cat /tmp/cli-version-report 2>/dev/null || echo 'n/a')"
+            echo
+            echo "Base: openab:pre-beta-${{ matrix.variant }} @ ${{ steps.meta.outputs.base_digest }} (consumed, never modified)"
+            echo
+            echo "The image aggregates a third-party agent CLI (the vendor's latest) under its vendor's terms; MIT covers this repository only. See NOTICE."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,108 @@
+# openab-pty — nightly channel. See .github/workflows/nightly-images.yml and
+# issue #12.
+#
+# The release channels (Dockerfile) ship whatever agent CLI the openab base was
+# built with, and that version is an ARG pinned in openab's Dockerfile.unified —
+# so a daily rebuild alone would republish the same CLI every day. The nightly
+# channel exists to carry the *latest* CLI: it starts FROM the same openab base
+# (pulled, never modified — this repo is a consumer of that image, not an owner)
+# and overwrites the one thing that should be newer, the agent CLI.
+#
+# Everything else deliberately matches Dockerfile: same builder stage, same
+# entrypoint, same env defaults, same uid. A nightly session should differ from
+# a pre-beta session in CLI version and nothing else.
+
+# Global ARGs — declared before the first FROM so they are visible inside FROM
+# itself (an ARG between stages is scoped to the following stage and FROM cannot
+# see it; Dockerfile has the same comment for the same hard-won reason).
+ARG OPENAB_BASE_DIGEST
+
+# --- build ------------------------------------------------------------------
+# Identical to the builder stage in Dockerfile, same digest pin and all: the
+# nightly runtime binary must be the same bytes-for-source as the release one,
+# or "nightly" quietly becomes a second runtime lineage nobody asked for.
+FROM docker.io/library/rust:1-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /src
+COPY runtime/Cargo.toml runtime/Cargo.lock ./
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl \
+    && rm -rf src
+
+COPY runtime/src ./src
+# The touch is load-bearing: cargo decides freshness by mtime and COPY preserves
+# the context's timestamps, so without it the stub build above is declared fresh
+# and the image ships a binary whose main() does nothing.
+RUN touch src/main.rs src/lib.rs \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl \
+    && strip target/x86_64-unknown-linux-musl/release/openab-pty
+
+# --- runtime ----------------------------------------------------------------
+# The openab base, digest-pinned per variant by the workflow at build time — the
+# digest is recorded in the job log so a base change can never silently alter an
+# unchanged build. This line consumes the base image; nothing in this repo ever
+# pushes, retags or deletes anything under ghcr.io/openabdev/openab.
+#
+# LICENSING BOUNDARY: as with Dockerfile, MIT covers this recipe, not what it
+# pulls in. The nightly images aggregate the openab base and a third-party agent
+# CLI under its vendor's own terms — and here the CLI is the vendor's *latest*,
+# resolved daily. See NOTICE.
+FROM ghcr.io/openabdev/openab@${OPENAB_BASE_DIGEST}
+
+# Root only for the CLI upgrade; dropped again below. The base runs as uid 1000
+# and npm -g / /usr/local/bin writes need root.
+USER root
+
+ARG VARIANT
+# For npm-sourced CLIs this is the version the workflow resolved from the
+# registry this morning, and the smoke test asserts the installed CLI reports
+# exactly it. For kiro the vendor publishes a `latest` URL instead of a queryable
+# version index, so the workflow passes "latest" and learns the version from the
+# built image afterwards.
+ARG CLI_VERSION
+RUN set -eux; \
+    case "${VARIANT}" in \
+      claude) \
+        npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}" --retry 3 \
+        && npm cache clean --force ;; \
+      codex) \
+        npm install -g "@openai/codex@${CLI_VERSION}" --fetch-retries=3 \
+        && npm cache clean --force ;; \
+      kiro) \
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 5 \
+          "https://prod.download.cli.kiro.dev/stable/latest/kirocli-x86_64-linux.zip" \
+          -o /tmp/kirocli.zip \
+        && unzip -q /tmp/kirocli.zip -d /tmp \
+        && cp /tmp/kirocli/bin/* /usr/local/bin/ \
+        && chmod +x /usr/local/bin/kiro-cli* \
+        && rm -rf /tmp/kirocli /tmp/kirocli.zip ;; \
+      *) echo "unknown nightly variant: ${VARIANT}" >&2; exit 1 ;; \
+    esac
+
+COPY --from=builder --chown=root:root --chmod=755 \
+    /src/target/x86_64-unknown-linux-musl/release/openab-pty /usr/local/bin/openab-pty
+# --chmod because entrypoint.sh is 644 in the repository and COPY preserves the
+# source mode; without it every container fails at "open executable: Permission
+# denied" (see the identical comment in Dockerfile).
+COPY --chown=root:root --chmod=755 deploy/ecs/entrypoint.sh /usr/local/bin/openab-pty-entrypoint
+
+USER 1000
+# Same defaults as Dockerfile, on purpose — the nightly channel changes the CLI
+# version and nothing else about how the runtime behaves.
+ENV HOME=/workspace \
+    RUST_LOG=info \
+    PTY_LISTEN=127.0.0.1:8090 \
+    PTY_COMMAND=/usr/bin/bash \
+    PTY_MAX_SESSIONS=3 \
+    PTY_ABSOLUTE_TTL=12h \
+    PTY_IDLE_TTL=8h \
+    PTY_TOKEN_TTL=12h \
+    PTY_SCROLLBACK_KIB=1024 \
+    PTY_SEED_DIR=""
+
+ENTRYPOINT ["/usr/local/bin/openab-pty-entrypoint"]

@@ -130,9 +130,19 @@ Published to `ghcr.io/openabdev/openab-pty`, one tag per agent CLI variant:
 |---|---|---|
 | push to `main` | `pre-beta-<variant>` | `openab:pre-beta-<variant>` |
 | `v*` tag | `beta-<variant>` | `openab:beta-<variant>` |
+| daily schedule | `nightly-<variant>` | `openab:pre-beta-<variant>` + the vendor's **latest** CLI |
 
 Every build also publishes an immutable `<variant>-<sha>`. Deploy that if you ever
 need to answer "which code is running" after the fact.
+
+The nightly channel exists because the release channels ship whatever CLI version
+the openab base was built with — a daily rebuild alone would republish the same
+CLI every day. Nightly images overwrite the agent CLI with the version the vendor
+published most recently, and each day also gets an immutable
+`nightly-YYYYMMDD-<variant>` as the rollback point. Variants publish
+independently: one vendor breaking their latest does not hold back the rest.
+Currently built for `claude`, `codex`, and `kiro`; the rest of the matrix follows
+(#12).
 
 The `native` variant carries no agent CLI, and is the only one whose contents are
 covered entirely by MIT-licensed code — see [`NOTICE`](NOTICE).
