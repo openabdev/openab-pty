@@ -670,7 +670,7 @@ pub struct Session {
     /// Never locked while the state lock is held: teardown must not be able to
     /// deadlock against attach.
     kill: tokio::sync::Mutex<SessionKillDomain>,
-    filter: Mutex<TermFilter>,
+    filter: Option<Mutex<TermFilter>>,
     backlog_bounds: QueueBounds,
     epoch: Instant,
     tier_best_effort: bool,
@@ -726,9 +726,9 @@ impl Session {
         {
             return Err(InputError::Evicted);
         }
-        let filtered = {
-            let mut filter = self.filter.lock();
-            filter.filter(bytes).to_vec()
+        let filtered = match &self.filter {
+            Some(filter) => filter.lock().filter(bytes).to_vec(),
+            None => bytes.to_vec(),
         };
         if filtered.is_empty() {
             return Ok(());
@@ -1166,7 +1166,10 @@ impl SessionManager {
             input: input_tx,
             control: spawned.control.clone(),
             kill: tokio::sync::Mutex::new(containment),
-            filter: Mutex::new(TermFilter::new()),
+            filter: self
+                .config
+                .filter_terminal_responses
+                .then(|| Mutex::new(TermFilter::new())),
             backlog_bounds: QueueBounds::new(
                 OUTBOUND_BACKLOG_KIB * 1024,
                 Some(OUTBOUND_BACKLOG_KIB as u64 * 1024 * 4),
@@ -2519,6 +2522,32 @@ mod tests {
         attached.write_input(b"ls\x1b[?62;22c -la\r").unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(spawner.written.lock().as_slice(), b"ls -la\r");
+    }
+
+    #[tokio::test]
+    async fn client_input_preserves_capability_responses_when_filter_is_disabled() {
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(
+            spawner.clone(),
+            "filter_terminal_responses = false\n",
+            SessionPolicy::default(),
+        );
+        let created = manager
+            .create(name("devin"), WindowSize::default())
+            .unwrap();
+        let attached = manager
+            .attach(
+                &name("devin"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
+            .unwrap();
+
+        let replies = b"\x1b[?0u\x1b[?65;1;2;6;21;22;17;28c\x1b[24;80R";
+        attached.write_input(replies).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(spawner.written.lock().as_slice(), replies);
     }
 
     #[tokio::test]
