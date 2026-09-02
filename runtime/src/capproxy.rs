@@ -115,7 +115,10 @@ fn classify_csi_query(s: &[u8]) -> Option<Match> {
     let mut i = 2;
     let mut params_start = 2;
     // Leading private marker (`?`, `>`, `=`).
-    let private = s.get(2).copied().filter(|b| matches!(b, b'?' | b'>' | b'='));
+    let private = s
+        .get(2)
+        .copied()
+        .filter(|b| matches!(b, b'?' | b'>' | b'='));
     if private.is_some() {
         i = 3;
         params_start = 3;
@@ -170,7 +173,11 @@ fn classify_osc_query(s: &[u8]) -> Option<Match> {
     if rest != b"?" {
         return None;
     }
-    let terminator: &[u8] = if s[len - 1] == BEL { b"\x07" } else { b"\x1b\\" };
+    let terminator: &[u8] = if s[len - 1] == BEL {
+        b"\x07"
+    } else {
+        b"\x1b\\"
+    };
     let colour: &[u8] = match ps {
         b"10" => b"rgb:c7c7/c7c7/c7c7", // foreground: light grey
         b"11" => b"rgb:1e1e/1e1e/1e1e", // background: near-black (dark UI)
@@ -182,7 +189,10 @@ fn classify_osc_query(s: &[u8]) -> Option<Match> {
     response.push(b';');
     response.extend_from_slice(colour);
     response.extend_from_slice(terminator);
-    Some(Match { consume: len, response })
+    Some(Match {
+        consume: len,
+        response,
+    })
 }
 
 fn string_sequence(s: &[u8], body: usize) -> Option<(&[u8], usize)> {

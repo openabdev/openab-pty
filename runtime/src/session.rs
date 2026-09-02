@@ -35,11 +35,11 @@
 //! the lock stays authoritative, the atomics are its I/O-side mirror.
 
 use crate::audit::{AuditEvent, AuditKind, AuditLogger, TerminationClass};
+use crate::capproxy::CapabilityProxy;
 use crate::close_code;
 use crate::config::PtyConfig;
 use crate::killdomain::{KillDomain, KillDomainTier, SessionKillDomain, TeardownOutcome};
 use crate::ringbuf::{ByteQueue, Push, QueueBounds, Replay, RingBuffer};
-use crate::capproxy::CapabilityProxy;
 use crate::termfilter::TermFilter;
 use crate::token::{MintedAttachToken, TokenStore};
 use crate::{Error, Generation, SessionName};
@@ -1845,9 +1845,7 @@ fn spawn_writer_thread(
 ) {
     std::thread::spawn(move || {
         while let Some(chunk) = input.blocking_recv() {
-            if !chunk.runtime_originated
-                && io.owner_conn.load(Ordering::Acquire) != chunk.conn.0
-            {
+            if !chunk.runtime_originated && io.owner_conn.load(Ordering::Acquire) != chunk.conn.0 {
                 continue;
             }
             if writer.write_all(&chunk.bytes).is_err() {
@@ -2627,7 +2625,12 @@ mod tests {
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
         let created = manager.create(name("cap"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("cap"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("cap"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
 
         spawner.emit(b"prompt\x1b[cdone");
