@@ -24,6 +24,7 @@
 
 pub mod admin_auth;
 pub mod audit;
+pub mod capproxy;
 pub mod config;
 pub mod containment;
 pub mod killdomain;
