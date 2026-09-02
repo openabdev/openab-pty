@@ -566,6 +566,12 @@ pub enum InputError {
 struct InputChunk {
     conn: ConnGeneration,
     bytes: Vec<u8>,
+    /// Set for bytes the runtime generates on the terminal's own behalf
+    /// (capability-query answers). The writer forwards these regardless of the
+    /// owner fence: the runtime must be able to answer a query even when no
+    /// client is attached, which is the detached-negotiation case #15 exists
+    /// for. Client input is always `false` and stays fenced.
+    runtime_originated: bool,
 }
 
 /// Shared I/O-side view of a session. The state lock is authoritative; these
@@ -674,8 +680,11 @@ pub struct Session {
     filter: Option<Mutex<TermFilter>>,
     /// Answers static capability queries from the child at the source (#15),
     /// so a detached session negotiates and replayed history is never
-    /// re-answered. Gated by the same flag as `filter`: both are the
-    /// capability-response machinery, on together or off together.
+    /// re-answered. ALWAYS on, deliberately NOT gated on
+    /// `filter_terminal_responses`: answering at the source is correct whatever
+    /// the client-side filter does, and gating it on that flag reintroduced the
+    /// Devin failures #15 fixed (the variant turns the filter off). Kept as
+    /// `Option` only so the output path can stay uniform; it is never `None`.
     proxy: Option<Mutex<CapabilityProxy>>,
     backlog_bounds: QueueBounds,
     epoch: Instant,
@@ -731,11 +740,27 @@ impl Session {
     /// must do so even when no client is attached. Uses the writer thread's
     /// current owner so the chunk is not dropped by its owner check.
     fn answer_child(&self, bytes: &[u8]) {
+        // Runtime-originated: forwarded past the owner fence so a detached
+        // session still negotiates. `conn` is unused by the writer for these
+        // but set to the current owner for symmetry.
         let conn = ConnGeneration(self.io.owner_conn.load(Ordering::Acquire));
-        let _ = self.input.try_send(InputChunk {
+        if let Err(error) = self.input.try_send(InputChunk {
             conn,
             bytes: bytes.to_vec(),
-        });
+            runtime_originated: true,
+        }) {
+            // A dropped answer is exactly the hang this path prevents, so it is
+            // logged rather than swallowed — a full input queue here means a
+            // client is flooding stdin, which is worth seeing.
+            tracing::warn!(
+                session = %self.name,
+                "capability answer dropped: input queue {}",
+                match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+                }
+            );
+        }
     }
 
     fn write_input(&self, conn: ConnGeneration, bytes: &[u8]) -> Result<(), InputError> {
@@ -756,6 +781,7 @@ impl Session {
             .try_send(InputChunk {
                 conn,
                 bytes: filtered,
+                runtime_originated: false,
             })
             .map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => InputError::Backpressure,
@@ -1189,10 +1215,12 @@ impl SessionManager {
                 .config
                 .filter_terminal_responses
                 .then(|| Mutex::new(TermFilter::new())),
-            proxy: self
-                .config
-                .filter_terminal_responses
-                .then(|| Mutex::new(CapabilityProxy::new())),
+            // Always on, unlike `filter`: answering static queries at the
+            // source is correct regardless of the client-side response filter,
+            // and gating it on that flag reintroduced the Devin failures #15
+            // fixed (the variant turns the filter off, which used to turn this
+            // off too). The client filter is a separate, older concern.
+            proxy: Some(Mutex::new(CapabilityProxy::new())),
             backlog_bounds: QueueBounds::new(
                 OUTBOUND_BACKLOG_KIB * 1024,
                 Some(OUTBOUND_BACKLOG_KIB as u64 * 1024 * 4),
@@ -1817,7 +1845,9 @@ fn spawn_writer_thread(
 ) {
     std::thread::spawn(move || {
         while let Some(chunk) = input.blocking_recv() {
-            if io.owner_conn.load(Ordering::Acquire) != chunk.conn.0 {
+            if !chunk.runtime_originated
+                && io.owner_conn.load(Ordering::Acquire) != chunk.conn.0
+            {
                 continue;
             }
             if writer.write_all(&chunk.bytes).is_err() {

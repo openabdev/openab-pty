@@ -144,12 +144,24 @@ clear and redraw rather than rendering a sliced ANSI stream) and `ttl-warning`
 
 ### 4.1 PTY output is not sanitised — that part is yours
 
-Binary frames are the shell's bytes, **verbatim**. The runtime filters the
-*client → PTY* direction only, and only for terminal-capability replies (§6 of the
-ADR): an emulator that answers Device Attributes on its own would otherwise inject
-those replies into the agent CLI's stdin. Nothing filters PTY → client, and that is
-deliberate — it is a terminal, and a runtime that stripped escape sequences would
-break the programs people attach to it.
+Binary frames are the shell's bytes, **verbatim**, with one narrow exception.
+The runtime answers *static* terminal-capability queries the child emits — Device
+Attributes (DA1/DA2), DSR status, kitty-keyboard flags, and OSC 10/11 colour — at
+the source, mirroring the reference client, and strips those queries from the
+PTY → client stream so they never reach you or the ring buffer. This lets a
+program negotiate even when no client is attached, and stops a `?since=` replay
+from re-answering a query into a shell with no reader. Everything else is passed
+through untouched — a runtime that stripped general escape sequences would break
+the programs people attach to it.
+
+**Cursor Position Report (`CSI 6 n`) is the exception to the exception.** The
+runtime has no screen model, so it cannot answer CPR; it passes the query through
+to you. If a program queries the cursor position, **your emulator must answer it**
+(SwiftTerm does so automatically). Because CPR is not consumed at the source it
+still rides the ring buffer, so a replay can re-deliver a CPR query — answer only
+queries that arrive live, not those replayed from history, or the answer echoes
+into the shell. (Answering CPR at the source awaits an embedded VT state machine;
+see openabdev/openab-pty#15.)
 
 The consequence for you: **the byte stream is untrusted input to your renderer.**
 Whatever runs in that shell — an agent CLI, a compromised dependency, a file the

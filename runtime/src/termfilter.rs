@@ -12,8 +12,10 @@
 //!
 //! Only the responses are stripped. Everything a human or a mouse can produce
 //! passes through byte-for-byte, which is why the finals we strip are limited to
-//! `c` (DA), `n` (DSR) and `R` (CPR): no key, mouse, focus, bracketed-paste or
-//! Kitty-keyboard encoding a terminal sends to an application uses them.
+//! `c` (DA) and `n` (DSR): no key, mouse, focus, bracketed-paste or
+//! Kitty-keyboard encoding a terminal sends to an application uses them. `R`
+//! (CPR) is deliberately left through — the runtime does not proxy CPR, so the
+//! client's answer must reach the child.
 //!
 //! **Chunk-scoped by design.** The filter holds no cross-call state: an escape
 //! sequence split across two WebSocket frames passes through unfiltered. The
@@ -109,8 +111,9 @@ fn classify(s: &[u8]) -> Option<usize> {
     }
 }
 
-/// `CSI ... c` (Device Attributes), `CSI ... n` (Device Status Report) and
-/// `CSI ... R` (Cursor Position Report) are responses. Every other final byte
+/// `CSI ... c` (Device Attributes) and `CSI ... n` (Device Status Report) are
+/// responses answered at the source; `CSI ... R` (CPR) is left through so the
+/// client can answer what the runtime cannot. Every other final byte
 /// belongs to input a terminal legitimately sends: `A`–`D` arrows, `~` tilde
 /// keys and bracketed paste, `M`/`m` mouse, `I`/`O` focus, `u` Kitty keyboard.
 fn classify_csi(s: &[u8]) -> Option<usize> {
@@ -123,7 +126,12 @@ fn classify_csi(s: &[u8]) -> Option<usize> {
             0x20..=0x3f => i += 1,
             // Final byte.
             0x40..=0x7e => {
-                return if matches!(b, b'c' | b'n' | b'R') {
+                // `R` (CPR) is intentionally NOT stripped: the runtime does
+                // not answer CPR (no screen state), so the client's CPR reply
+                // must be allowed through to the child. DA (`c`) and DSR (`n`)
+                // are answered at the source by CapabilityProxy and any client
+                // echo of them here is redundant, so they stay filtered.
+                return if matches!(b, b'c' | b'n') {
                     Some(i + 1)
                 } else {
                     None
@@ -221,9 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn strips_cursor_position_report() {
-        assert!(filtered(b"\x1b[24;80R").is_empty());
-        assert!(filtered(b"\x1b[?24;80;1R").is_empty(), "DECXCPR");
+    fn passes_cursor_position_report_for_the_child_to_receive() {
+        // CPR is not proxied, so the client's answer must reach the child.
+        assert_eq!(filtered(b"\x1b[24;80R"), b"\x1b[24;80R");
+        assert_eq!(filtered(b"\x1b[?24;80;1R"), b"\x1b[?24;80;1R", "DECXCPR");
     }
 
     #[test]
@@ -259,7 +268,8 @@ mod tests {
 
     #[test]
     fn strips_multiple_responses_in_one_chunk() {
-        assert_eq!(filtered(b"a\x1b[0nb\x1b[24;80Rc"), b"abc");
+        // DA and DSR still stripped; CPR passes through untouched.
+        assert_eq!(filtered(b"a\x1b[0nb\x1b[24;80Rc"), b"ab\x1b[24;80Rc");
     }
 
     #[test]
@@ -338,8 +348,8 @@ mod tests {
     fn counters_track_what_was_removed() {
         let mut f = TermFilter::new();
         let out = f.filter(b"x\x1b[0n\x1b[24;80Ry");
-        assert_eq!(out.as_ref(), b"xy");
-        assert_eq!(f.stripped_sequences(), 2);
-        assert_eq!(f.stripped_bytes(), 4 + 8);
+        assert_eq!(out.as_ref(), b"x\x1b[24;80Ry", "CPR passes, DSR stripped");
+        assert_eq!(f.stripped_sequences(), 1);
+        assert_eq!(f.stripped_bytes(), 4);
     }
 }
