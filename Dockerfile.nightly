@@ -28,27 +28,54 @@ ARG OPENAB_BASE_DIGEST
 # cross-compiles to the target arch, rather than emulating the whole toolchain
 # under QEMU per arch — an emulated cargo build is minutes-to-tens-of-minutes
 # slower and is the difference between a viable arm64 leg and one nobody waits
-# for. The static musl output means the cross-linked binary has no libc
-# dependency on the runtime base, so a plain `rustup target add` (no C
-# cross-toolchain) is enough.
+# for.
+#
+# Cross-linking a *static musl* binary needs a musl cross-linker for the target
+# arch — this was learned the hard way (issue #21, run 33774193328): `musl-tools`
+# only ships the host arch's musl-gcc, so cross-linking aarch64 with it fails at
+# `crt1.o`, and cargo-zigbuild rejects rustc's `--fix-cortex-a53-843419` linker
+# arg. The official musl.cc cross toolchains link cleanly for both arches, so
+# each arch gets its real `<triple>-gcc` as the Rust linker.
 FROM --platform=$BUILDPLATFORM docker.io/library/rust:1-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
 
-# TARGETARCH is provided automatically by buildx (amd64 | arm64). Map it to the
-# Rust musl triple once, here, so every cargo invocation below stays in sync.
-ARG TARGETARCH
-RUN case "${TARGETARCH}" in \
-      amd64) echo x86_64-unknown-linux-musl  > /rust-target ;; \
-      arm64) echo aarch64-unknown-linux-musl > /rust-target ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac
-
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools \
-    && rm -rf /var/lib/apt/lists/* \
-    && rustup target add "$(cat /rust-target)"
+    && apt-get install -y --no-install-recommends curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# TARGETARCH is provided automatically by buildx (amd64 | arm64). Map it to the
+# Rust musl triple and the matching musl.cc cross toolchain once, here, so every
+# cargo invocation below stays in sync.
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) TRIPLE=x86_64-unknown-linux-musl;  CROSS=x86_64-linux-musl-cross ;; \
+      arm64) TRIPLE=aarch64-unknown-linux-musl; CROSS=aarch64-linux-musl-cross ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    echo "$TRIPLE" > /rust-target; \
+    # musl.cc gcc prefix is the triple with the vendor field dropped
+    # (x86_64-linux-musl-gcc / aarch64-linux-musl-gcc). The toolchain ships a
+    # matching `-strip`, which — unlike the host binutils `strip` — can read the
+    # target-arch ELF (host strip fails with "Unable to recognise the format").
+    echo "${CROSS%-cross}-gcc" > /musl-cc; \
+    echo "${CROSS%-cross}-strip" > /musl-strip; \
+    curl -fsSL --retry 5 --retry-all-errors "https://musl.cc/${CROSS}.tgz" -o /tmp/cross.tgz; \
+    tar -xzf /tmp/cross.tgz -C /opt; \
+    rm /tmp/cross.tgz; \
+    rustup target add "$TRIPLE"
+
+ENV PATH=/opt/x86_64-linux-musl-cross/bin:/opt/aarch64-linux-musl-cross/bin:$PATH
 
 WORKDIR /src
 COPY runtime/Cargo.toml runtime/Cargo.lock ./
+# Point the target's linker (and C compiler, for any build script) at the musl
+# cross gcc. Both env vars are read by cargo/cc for the resolved triple; only
+# the target arch's toolchain is present, so the unused var names a missing
+# binary and is never invoked.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+    CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+    CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
     && cargo build --release --locked --target "$(cat /rust-target)" \
     && rm -rf src
@@ -62,7 +89,7 @@ COPY runtime/src ./src
 # COPY does not need to know the triple.
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked --target "$(cat /rust-target)" \
-    && strip "target/$(cat /rust-target)/release/openab-pty" \
+    && "$(cat /musl-strip)" "target/$(cat /rust-target)/release/openab-pty" \
     && cp "target/$(cat /rust-target)/release/openab-pty" /openab-pty
 
 # The workflow fetches the Hermes installer through GitHub's authenticated
