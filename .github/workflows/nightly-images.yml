@@ -181,17 +181,55 @@ jobs:
           # The base is the same pre-beta variant the release channel builds
           # from, digest-pinned at build time and recorded here so the log
           # answers "what base was under this nightly" after the fact.
+          #
+          # Pin the *index* (manifest-list) digest, not a single arch's
+          # sub-manifest: the build is multi-arch now, and passing the index
+          # digest to FROM lets buildx select the matching per-arch base for
+          # each platform leg. Pinning one arch's sub-manifest would force that
+          # arch's base under the other arch's build. Digest-pinning still holds
+          # — the index digest is immutable and its per-arch members are fixed.
           T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
-          DIGEST=$(curl -s -H "Authorization: Bearer $T" \
+          BASE_TAG="pre-beta-${{ matrix.variant }}"
+          DIGEST=$(curl -sI -H "Authorization: Bearer $T" \
             -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://ghcr.io/v2/openabdev/openab/manifests/pre-beta-${{ matrix.variant }}" \
-            | jq -r '.manifests[]|select(.platform.architecture=="amd64").digest')
+            "https://ghcr.io/v2/openabdev/openab/manifests/${BASE_TAG}" \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-            echo "FAIL: could not resolve digest for pre-beta-${{ matrix.variant }}" >&2
+            echo "FAIL: could not resolve index digest for ${BASE_TAG}" >&2
             exit 1
           fi
+          # Belt-and-braces: confirm the arches this nightly will build are
+          # actually present in the resolved index, so a base that regressed to
+          # single-arch fails here with a clear message rather than deep in a
+          # buildx leg. grok is amd64-only by vendor, checked accordingly.
+          ARCHES=$(curl -s -H "Authorization: Bearer $T" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/openabdev/openab/manifests/${BASE_TAG}" \
+            | jq -r '[.manifests[].platform.architecture]|@csv')
+          echo "$ARCHES" | grep -q amd64 || { echo "FAIL: base $BASE_TAG has no amd64" >&2; exit 1; }
+          if [ "${{ matrix.variant }}" != "grok" ]; then
+            echo "$ARCHES" | grep -q arm64 || { echo "FAIL: base $BASE_TAG has no arm64" >&2; exit 1; }
+          fi
           echo "base_digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Resolved pre-beta-${{ matrix.variant }} -> $DIGEST"
+          echo "Resolved ${BASE_TAG} (index) -> $DIGEST [arches: $ARCHES]"
+
+          # Target platforms for this variant. Multi-arch everywhere except
+          # grok, whose vendor publishes no arm64 Linux binary (issue #21) — an
+          # arm64 grok leg would 404 in the Dockerfile, so it stays amd64-only
+          # and arm64 hosts fall back to Rosetta for grok alone, as before.
+          if [ "${{ matrix.variant }}" = "grok" ]; then
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      # arm64 legs execute arm64 binaries in their RUN steps (npm, the CLI
+      # installers) on an amd64 runner, so QEMU user-mode emulation is
+      # required. The Rust builder itself cross-compiles natively
+      # (--platform=$BUILDPLATFORM) and does not pay this cost.
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm64
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -203,9 +241,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Built into the local daemon, not pushed — the smoke test is the gate,
-      # and it is only a gate if nothing is public before it runs.
-      - name: Build into the local daemon
+      # The amd64 gate leg: built into the local daemon (not pushed) so the
+      # smoke test below can run un-emulated on the amd64 runner. This is only a
+      # gate if nothing is public before it runs. The multi-arch push step later
+      # reuses this leg's cache, so amd64 is not rebuilt — the bytes pushed for
+      # amd64 are the same ones tested here.
+      - name: Build the amd64 gate image into the local daemon
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -310,19 +351,38 @@ jobs:
 
           docker rm -f pty >/dev/null
 
-      # Retag the exact bytes that passed; never rebuild between test and push.
-      - name: Push the image that passed
+      # Push the manifest that passed. The amd64 leg is served from the gate
+      # build's cache (same source, same args, same scope), so the amd64 bytes
+      # published are the ones the smoke test above ran against; only the arm64
+      # leg is built here. buildx cannot `load` a multi-arch image into the
+      # daemon, so the manifest is assembled and pushed directly rather than
+      # retagged — which is why the amd64 gate build stays a separate step.
+      #
+      # The arm64 leg is not smoke-tested (the runner is amd64; testing it would
+      # mean running the whole image under QEMU, which is slow and flaky). It is
+      # built from identical source and the same resolved CLI, and the dated
+      # immutable tag is the rollback path — the nightly trade already stated in
+      # this file's header.
+      - name: Build and push the multi-arch manifest
         if: github.event_name != 'pull_request'
-        env:
-          MOVING: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
-          IMMUTABLE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}
-        run: |
-          set -euo pipefail
-          docker tag openab-pty:nightly-candidate "$MOVING"
-          docker tag openab-pty:nightly-candidate "$IMMUTABLE"
-          docker push -q "$MOVING"
-          docker push -q "$IMMUTABLE"
-          echo "pushed $MOVING and $IMMUTABLE"
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.nightly
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}
+          build-args: |
+            OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
+            VARIANT=${{ matrix.variant }}
+            CLI_VERSION=${{ steps.meta.outputs.cli_version }}
+            CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
+            CLI_REF=${{ steps.meta.outputs.cli_ref }}
+          cache-from: type=gha,scope=nightly-${{ matrix.variant }}
+          cache-to: type=gha,scope=nightly-${{ matrix.variant }},mode=max
+          provenance: false
 
       - name: Summary
         run: |
