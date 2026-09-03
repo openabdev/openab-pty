@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# ptycp — recursive copy between local paths and openab-pty pods (scp-like)
+#
+# Usage:
+#   ptycp SOURCE DESTINATION
+#
+#   Remote form:  POD:/path        (e.g. devin-8818:/workspace)
+#   Local form:   any plain path   (e.g. ./workspace, /tmp/x)
+#
+#   Trailing slash on a directory SOURCE means "copy contents" (rsync-like):
+#     ptycp devin-8818:/workspace/ ./out     -> ./out/<files>
+#     ptycp devin-8818:/workspace  ./out     -> ./out/workspace/<files>
+#
+# Env overrides:
+#   PTYCP_NAMESPACE  (default: openab-pty)
+#   PTYCP_CONTAINER  (default: openab-pty)
+#
+set -euo pipefail
+
+NS="${PTYCP_NAMESPACE:-openab-pty}"
+CONTAINER="${PTYCP_CONTAINER:-openab-pty}"
+
+# Stop macOS bsdtar from emitting AppleDouble ._* metadata files
+export COPYFILE_DISABLE=1
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+[ $# -eq 2 ] || usage
+
+SRC="$1"
+DST="$2"
+
+# A remote spec is "pod:path" where the part before ':' has no '/'
+# (so /tmp/a:b or ./weird:name are treated as local).
+is_remote() {
+  case "$1" in
+    */*:*) return 1 ;;   # slash before the colon -> local path
+    *:*)   return 0 ;;
+    *)     return 1 ;;
+  esac
+}
+
+pod_of()  { printf '%s' "${1%%:*}"; }
+path_of() { printf '%s' "${1#*:}"; }
+
+# Compute the "tar create" side of the pipe: tar cf - -C $TAR_DIR $TAR_ITEM
+# Trailing slash on a dir = copy contents (rsync-like).
+tar_create_args() {
+  local p="$1"
+  if [ "${p%/}" != "$p" ]; then
+    TAR_DIR="${p%/}"
+    TAR_ITEM="."
+  else
+    TAR_DIR="$(dirname "$p")"
+    TAR_ITEM="$(basename "$p")"
+  fi
+}
+
+remote_exec()   { kubectl exec -n "$NS" "$1" -c "$CONTAINER" -- "${@:2}"; }
+remote_exec_i() { kubectl exec -n "$NS" "$1" -c "$CONTAINER" -i -- "${@:2}"; }
+
+src_remote=false; dst_remote=false
+is_remote "$SRC" && src_remote=true
+is_remote "$DST" && dst_remote=true
+
+if $src_remote; then
+  SRC_POD="$(pod_of "$SRC")"; SRC_PATH="$(path_of "$SRC")"
+fi
+if $dst_remote; then
+  DST_POD="$(pod_of "$DST")"; DST_PATH="$(path_of "$DST")"
+fi
+
+if ! $src_remote && ! $dst_remote; then
+  # local -> local
+  mkdir -p "$DST"
+  cp -R "$SRC" "$DST"
+
+elif $src_remote && ! $dst_remote; then
+  # remote -> local
+  tar_create_args "$SRC_PATH"
+  mkdir -p "$DST"
+  remote_exec "$SRC_POD" tar cf - -C "$TAR_DIR" "$TAR_ITEM" | tar xf - -C "$DST"
+
+elif ! $src_remote && $dst_remote; then
+  # local -> remote
+  [ -e "$SRC" ] || { echo "ptycp: source not found: $SRC" >&2; exit 1; }
+  tar_create_args "$SRC"
+  remote_exec "$DST_POD" mkdir -p "$DST_PATH"
+  tar cf - -C "$TAR_DIR" "$TAR_ITEM" | remote_exec_i "$DST_POD" tar xf - -C "$DST_PATH"
+
+else
+  # remote -> remote
+  tar_create_args "$SRC_PATH"
+  remote_exec "$DST_POD" mkdir -p "$DST_PATH"
+  remote_exec "$SRC_POD" tar cf - -C "$TAR_DIR" "$TAR_ITEM" | remote_exec_i "$DST_POD" tar xf - -C "$DST_PATH"
+fi
