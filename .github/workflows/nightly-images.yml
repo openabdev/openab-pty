@@ -227,7 +227,7 @@ jobs:
       # installers) on an amd64 runner, so QEMU user-mode emulation is
       # required. The Rust builder itself cross-compiles natively
       # (--platform=$BUILDPLATFORM) and does not pay this cost.
-      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
           platforms: arm64
 
