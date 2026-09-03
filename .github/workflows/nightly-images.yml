@@ -49,19 +49,40 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
-  image:
+  # One build per (variant, arch) on that arch's *native* GitHub-hosted runner —
+  # ubuntu-24.04 for amd64, ubuntu-24.04-arm for arm64 (free for public repos).
+  # Native means no cross toolchain, no QEMU, and — the real win — the smoke
+  # test runs the arm64 image on real arm64 hardware instead of skipping it.
+  #
+  # Each leg builds and pushes *by digest* only (no tag). The merge job below
+  # assembles the per-arch digests into the moving/immutable tags, so a tag
+  # never points at a half-built manifest.
+  build:
     needs: ci
-    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        # Every agent-CLI variant. `native` is the sole exclusion: by
-        # definition it carries no agent CLI, so there is nothing to freshen.
         variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
                   grok, hermes, kiro, mimocode, opencode, pi]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        # grok's vendor ships no arm64 Linux binary (issue #21), so it is
+        # amd64-only; arm64 hosts fall back to Rosetta for grok alone.
+        exclude:
+          - variant: grok
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    outputs:
+      # Not consumable directly (matrix outputs collapse), so the merge job
+      # reads the per-arch digests from artifacts instead. Kept here for clarity.
+      date: ${{ steps.meta.outputs.date }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -156,7 +177,13 @@ jobs:
             devin)
               MANIFEST=$(curl -fsSL --retry 3 https://static.devin.ai/cli/current/manifest.json)
               CLI_VERSION=$(echo "$MANIFEST" | jq -r .version)
-              CLI_SHA256=$(echo "$MANIFEST" | jq -r '.platforms["x86_64-unknown-linux"].sha256') ;;
+              # Per-arch sha256: the Dockerfile downloads the arch matching this
+              # leg, so verify against that arch's checksum, not a fixed one.
+              case "${{ matrix.arch }}" in
+                amd64) DEVIN_KEY="x86_64-unknown-linux" ;;
+                arm64) DEVIN_KEY="aarch64-unknown-linux" ;;
+              esac
+              CLI_SHA256=$(echo "$MANIFEST" | jq -r ".platforms[\"${DEVIN_KEY}\"].sha256") ;;
             grok)
               CLI_VERSION=$(curl -fsSL --retry 3 https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d '[:space:]') ;;
             kiro)
@@ -179,15 +206,10 @@ jobs:
           echo "Resolved ${{ matrix.variant }} CLI -> $CLI_VERSION${CLI_REF:+ @ $CLI_REF}"
 
           # The base is the same pre-beta variant the release channel builds
-          # from, digest-pinned at build time and recorded here so the log
-          # answers "what base was under this nightly" after the fact.
-          #
-          # Pin the *index* (manifest-list) digest, not a single arch's
-          # sub-manifest: the build is multi-arch now, and passing the index
-          # digest to FROM lets buildx select the matching per-arch base for
-          # each platform leg. Pinning one arch's sub-manifest would force that
-          # arch's base under the other arch's build. Digest-pinning still holds
-          # — the index digest is immutable and its per-arch members are fixed.
+          # from. Pin the *index* (manifest-list) digest, not one arch's
+          # sub-manifest: passing the index digest to FROM lets buildx pick the
+          # sub-manifest matching this leg's native arch. Digest-pinning still
+          # holds — the index digest is immutable and its members are fixed.
           T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
           BASE_TAG="pre-beta-${{ matrix.variant }}"
           DIGEST=$(curl -sI -H "Authorization: Bearer $T" \
@@ -198,38 +220,16 @@ jobs:
             echo "FAIL: could not resolve index digest for ${BASE_TAG}" >&2
             exit 1
           fi
-          # Belt-and-braces: confirm the arches this nightly will build are
-          # actually present in the resolved index, so a base that regressed to
-          # single-arch fails here with a clear message rather than deep in a
-          # buildx leg. grok is amd64-only by vendor, checked accordingly.
+          # Confirm this leg's arch is actually in the base index, so a base that
+          # regressed to single-arch fails here with a clear message.
           ARCHES=$(curl -s -H "Authorization: Bearer $T" \
             -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
             "https://ghcr.io/v2/openabdev/openab/manifests/${BASE_TAG}" \
             | jq -r '[.manifests[].platform.architecture]|@csv')
-          echo "$ARCHES" | grep -q amd64 || { echo "FAIL: base $BASE_TAG has no amd64" >&2; exit 1; }
-          if [ "${{ matrix.variant }}" != "grok" ]; then
-            echo "$ARCHES" | grep -q arm64 || { echo "FAIL: base $BASE_TAG has no arm64" >&2; exit 1; }
-          fi
+          echo "$ARCHES" | grep -q "${{ matrix.arch }}" || {
+            echo "FAIL: base $BASE_TAG has no ${{ matrix.arch }} [arches: $ARCHES]" >&2; exit 1; }
           echo "base_digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Resolved ${BASE_TAG} (index) -> $DIGEST [arches: $ARCHES]"
-
-          # Target platforms for this variant. Multi-arch everywhere except
-          # grok, whose vendor publishes no arm64 Linux binary (issue #21) — an
-          # arm64 grok leg would 404 in the Dockerfile, so it stays amd64-only
-          # and arm64 hosts fall back to Rosetta for grok alone, as before.
-          if [ "${{ matrix.variant }}" = "grok" ]; then
-            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
-          else
-            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-          fi
-
-      # arm64 legs execute arm64 binaries in their RUN steps (npm, the CLI
-      # installers) on an amd64 runner, so QEMU user-mode emulation is
-      # required. The Rust builder itself cross-compiles natively
-      # (--platform=$BUILDPLATFORM) and does not pay this cost.
-      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
-        with:
-          platforms: arm64
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -241,17 +241,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The amd64 gate leg: built into the local daemon (not pushed) so the
-      # smoke test below can run un-emulated on the amd64 runner. This is only a
-      # gate if nothing is public before it runs. The multi-arch push step later
-      # reuses this leg's cache, so amd64 is not rebuilt — the bytes pushed for
-      # amd64 are the same ones tested here.
-      - name: Build the amd64 gate image into the local daemon
+      # Built into the local daemon (native arch, no emulation) so the smoke
+      # test is the gate before anything is published. Same tags/args on the
+      # push step below, and buildx serves it from this build's cache, so the
+      # bytes tested are the bytes pushed.
+      - name: Build the candidate image into the local daemon
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.nightly
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           load: true
           push: false
           tags: openab-pty:nightly-candidate
@@ -261,12 +260,13 @@ jobs:
             CLI_VERSION=${{ steps.meta.outputs.cli_version }}
             CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
             CLI_REF=${{ steps.meta.outputs.cli_ref }}
-          cache-from: type=gha,scope=nightly-${{ matrix.variant }}
-          cache-to: type=gha,scope=nightly-${{ matrix.variant }},mode=max
+          cache-from: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }},mode=max
           provenance: false
 
-      # The image.yml contract checks, plus the one this channel exists for:
-      # the CLI inside must be the version resolved this morning.
+      # The image.yml contract checks, plus the one this channel exists for: the
+      # CLI must be the version resolved this morning. Now runs natively on both
+      # arches — the arm64 image is exercised on real arm64 hardware.
       - name: Smoke test the candidate image
         env:
           IMAGE: openab-pty:nightly-candidate
@@ -274,6 +274,12 @@ jobs:
           CLI_REF: ${{ steps.meta.outputs.cli_ref }}
         run: |
           set -euo pipefail
+
+          # 0. The image really is this leg's arch (not a silent emulation slip).
+          GOT_ARCH="$(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
+          [ "$GOT_ARCH" = "${{ matrix.arch }}" ] || {
+            echo "FAIL: image arch $GOT_ARCH != expected ${{ matrix.arch }}" >&2; exit 1; }
+          echo "ok: image architecture is ${{ matrix.arch }}"
 
           # 1. Refuses to start without an admin credential hash.
           if docker run --rm "$IMAGE" --version >/dev/null 2>&1; then
@@ -345,58 +351,146 @@ jobs:
               *) echo "FAIL: expected CLI $CLI_VERSION, image reports: $GOT" >&2; exit 1 ;;
             esac
           fi
-          # Recorded for the summary — for kiro this is where the version is
-          # learned, since the vendor's latest URL carries no version index.
-          echo "$GOT" > /tmp/cli-version-report
+          # Recorded for the merge summary — for kiro this is where the version
+          # is learned, since the vendor's latest URL carries no version index.
+          echo "$GOT" > cli-version-report
 
           docker rm -f pty >/dev/null
 
-      # Push the manifest that passed. The amd64 leg is served from the gate
-      # build's cache (same source, same args, same scope), so the amd64 bytes
-      # published are the ones the smoke test above ran against; only the arm64
-      # leg is built here. buildx cannot `load` a multi-arch image into the
-      # daemon, so the manifest is assembled and pushed directly rather than
-      # retagged — which is why the amd64 gate build stays a separate step.
-      #
-      # The arm64 leg is not smoke-tested (the runner is amd64; testing it would
-      # mean running the whole image under QEMU, which is slow and flaky). It is
-      # built from identical source and the same resolved CLI, and the dated
-      # immutable tag is the rollback path — the nightly trade already stated in
-      # this file's header.
-      - name: Build and push the multi-arch manifest
+      # Push the exact bytes that passed, by digest only (no tag). The merge job
+      # assembles the tags from the per-arch digests. Reuses this leg's cache so
+      # nothing is rebuilt between test and push.
+      - name: Push the candidate by digest
+        id: push
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.nightly
-          platforms: ${{ steps.meta.outputs.platforms }}
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}
+          platforms: linux/${{ matrix.arch }}
+          # Push by digest: no tag written here.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             OPENAB_BASE_DIGEST=${{ steps.meta.outputs.base_digest }}
             VARIANT=${{ matrix.variant }}
             CLI_VERSION=${{ steps.meta.outputs.cli_version }}
             CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
             CLI_REF=${{ steps.meta.outputs.cli_ref }}
-          cache-from: type=gha,scope=nightly-${{ matrix.variant }}
-          cache-to: type=gha,scope=nightly-${{ matrix.variant }},mode=max
+          cache-from: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }}
           provenance: false
+
+      - name: Export the pushed digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          [ -n "$digest" ] || { echo "FAIL: no digest from push step" >&2; exit 1; }
+          # Filename is the digest sans algo prefix; content is the CLI report.
+          echo "$digest" > "/tmp/digests/${{ matrix.arch }}"
+          echo "arch=${{ matrix.arch }} digest=$digest"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload CLI report
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: clireport-${{ matrix.variant }}-${{ matrix.arch }}
+          path: cli-version-report
+          retention-days: 1
+          if-no-files-found: warn
+
+  # One merge job per variant: collect the per-arch digests pushed above and
+  # bind them under the moving and immutable tags as a single manifest list.
+  # `imagetools create` composes existing digests without pulling or rebuilding,
+  # so the published manifest references the exact bytes each native runner
+  # tested.
+  merge:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
+                  grok, hermes, kiro, mimocode, opencode, pi]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Compute the date tag
+        id: meta
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Download this variant's arch digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - name: Download this variant's CLI reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/clireports
+          pattern: clireport-${{ matrix.variant }}-*
+          merge-multiple: true
+        continue-on-error: true
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest list
+        env:
+          MOVING: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}
+          IMMUTABLE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}
+          REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          # Each file under /tmp/digests holds a sha256:... digest for one arch.
+          SRCS=()
+          for f in /tmp/digests/*; do
+            d="$(cat "$f")"
+            case "$d" in
+              sha256:*) SRCS+=("${REPO}@${d}") ;;
+              *) echo "FAIL: bad digest in $f: $d" >&2; exit 1 ;;
+            esac
+          done
+          [ "${#SRCS[@]}" -ge 1 ] || { echo "FAIL: no arch digests for ${{ matrix.variant }}" >&2; exit 1; }
+          echo "Composing ${#SRCS[@]} arch(es): ${SRCS[*]}"
+
+          docker buildx imagetools create -t "$MOVING" -t "$IMMUTABLE" "${SRCS[@]}"
+
+          echo "=== published manifest ==="
+          docker buildx imagetools inspect "$MOVING" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{.Digest}}{{println}}{{end}}'
 
       - name: Summary
         run: |
           {
-            echo "### Nightly image pushed"
+            echo "### Nightly image pushed (multi-arch, native builds)"
             echo
             echo '```'
             echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ matrix.variant }}"
             echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ steps.meta.outputs.date }}-${{ github.run_id }}-${{ matrix.variant }}"
             echo '```'
             echo
-            echo "CLI: $(cat /tmp/cli-version-report 2>/dev/null || echo 'n/a')"
+            echo "CLI: $(cat /tmp/clireports/cli-version-report 2>/dev/null || echo 'n/a')"
             echo
-            echo "Base: openab:pre-beta-${{ matrix.variant }} @ ${{ steps.meta.outputs.base_digest }} (consumed, never modified)"
+            echo "Each arch was built and smoke-tested on its native runner, then bound into the manifest by digest."
             echo
             echo "The image aggregates a third-party agent CLI (the vendor's latest) under its vendor's terms; MIT covers this repository only. See NOTICE."
           } >> "$GITHUB_STEP_SUMMARY"
