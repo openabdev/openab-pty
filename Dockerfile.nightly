@@ -20,21 +20,22 @@
 ARG OPENAB_BASE_DIGEST
 
 # --- build ------------------------------------------------------------------
-# Identical to the builder stage in Dockerfile, same digest pin and all: the
-# nightly runtime binary must be the same bytes-for-source as the release one,
-# or "nightly" quietly becomes a second runtime lineage nobody asked for.
+# Identical to the builder stage in Dockerfile: the nightly runtime binary must
+# be the same bytes-for-source as the release one, or "nightly" quietly becomes
+# a second runtime lineage nobody asked for.
 #
-# The builder pins its platform to the build host (BUILDPLATFORM) and
-# cross-compiles to the target arch, rather than emulating the whole toolchain
-# under QEMU per arch — an emulated cargo build is minutes-to-tens-of-minutes
-# slower and is the difference between a viable arm64 leg and one nobody waits
-# for. The static musl output means the cross-linked binary has no libc
-# dependency on the runtime base, so a plain `rustup target add` (no C
-# cross-toolchain) is enough.
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
+# No cross-compilation and no --platform pin: the workflow builds each arch on
+# its own *native* GitHub-hosted runner (ubuntu-24.04 for amd64, ubuntu-24.04-arm
+# for arm64), so the builder always targets the host arch. That keeps this stage
+# a plain native `cargo build` — musl-tools ships the host arch's musl-gcc, which
+# is exactly what a native build needs. (An earlier revision cross-compiled from
+# one amd64 runner; that needed a musl *cross* toolchain and QEMU for the arm64
+# leg, and could not smoke-test arm64. Native runners removed all of that.)
+FROM docker.io/library/rust:1-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
 
-# TARGETARCH is provided automatically by buildx (amd64 | arm64). Map it to the
-# Rust musl triple once, here, so every cargo invocation below stays in sync.
+# The host-native musl target. TARGETARCH is provided by buildx and, for a
+# single-platform native build, matches the runner arch — map it to the triple
+# once so every cargo invocation stays in sync.
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
       amd64) echo x86_64-unknown-linux-musl  > /rust-target ;; \
