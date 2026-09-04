@@ -63,7 +63,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
-                  grok, hermes, kiro, mimocode, opencode, pi]
+                  grok, kiro, mimocode, opencode, pi]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -88,12 +88,6 @@ jobs:
 
       - name: Resolve the latest CLI version and the base digest
         id: meta
-        env:
-          # Used only for the Hermes cross-repo Contents API request. An
-          # authenticated API fetch avoids the shared-runner 429s seen on
-          # raw.githubusercontent.com (run 33565582163), while the resolved
-          # commit below keeps the installer and checkout immutable.
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -103,23 +97,13 @@ jobs:
           # below was verified against the live endpoint before being wired in:
           #   npm registry /latest document ....... claude codex copilot gemini
           #                                         opencode mimocode pi
-          #   GitHub releases/latest .............. antigravity hermes
+          #   GitHub releases/latest .............. antigravity
           #   install script's embedded version ... cursor
           #   cli/current/manifest.json ........... devin (also carries sha256)
           #   GCS channel version file ............ grok
           #   vendor `latest` download URL ........ kiro (version learned from
           #                                         the built image afterwards)
           CLI_SHA256=""
-          CLI_REF=""
-          # Dockerfile.nightly mounts this build-context file without copying it
-          # into the final image. Non-Hermes jobs still need the path to exist.
-          printf '#!/bin/sh\nexit 1\n' > .nightly-hermes-install.sh
-
-          github_api() {
-            curl -fsSL --retry 3 --retry-all-errors \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
-          }
 
           case "${{ matrix.variant }}" in
             claude)
@@ -138,35 +122,6 @@ jobs:
               CLI_VERSION=$(curl -fsSL --retry 3 https://registry.npmjs.org/@earendil-works/pi-coding-agent/latest | jq -r .version) ;;
             antigravity)
               CLI_VERSION=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name) ;;
-            hermes)
-              RELEASE=$(github_api https://api.github.com/repos/NousResearch/hermes-agent/releases/latest)
-              CLI_VERSION=$(echo "$RELEASE" | jq -r .tag_name)
-
-              # Dereference an annotated (possibly nested) release tag to its
-              # immutable commit. Fetch both the installer and source checkout
-              # from this SHA, never from the movable tag name.
-              REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/ref/tags/${CLI_VERSION}")
-              REF_TYPE=$(echo "$REF" | jq -r .object.type)
-              CLI_REF=$(echo "$REF" | jq -r .object.sha)
-              for _ in 1 2 3; do
-                [ "$REF_TYPE" = "tag" ] || break
-                REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/tags/${CLI_REF}")
-                REF_TYPE=$(echo "$REF" | jq -r .object.type)
-                CLI_REF=$(echo "$REF" | jq -r .object.sha)
-              done
-              [ "$REF_TYPE" = "commit" ] || {
-                echo "FAIL: Hermes release $CLI_VERSION did not resolve to a commit" >&2
-                exit 1
-              }
-
-              github_api -H 'Accept: application/vnd.github.raw+json' \
-                "https://api.github.com/repos/NousResearch/hermes-agent/contents/scripts/install.sh?ref=${CLI_REF}" \
-                > .nightly-hermes-install.sh
-              [ "$(head -1 .nightly-hermes-install.sh)" = '#!/bin/bash' ] || {
-                echo "FAIL: Hermes installer response is not the expected script" >&2
-                exit 1
-              }
-              chmod 755 .nightly-hermes-install.sh ;;
             cursor)
               # The install script embeds the version it would install; there is
               # no separate version index. Anchored to the download URL shape so
@@ -194,16 +149,11 @@ jobs:
               echo "FAIL: invalid CLI version for ${{ matrix.variant }}: $CLI_VERSION" >&2
               exit 1 ;;
           esac
-          if [ -n "$CLI_REF" ] && ! echo "$CLI_REF" | grep -qE '^[0-9a-f]{40}$'; then
-            echo "FAIL: invalid immutable ref for ${{ matrix.variant }}: $CLI_REF" >&2
-            exit 1
-          fi
           {
             echo "cli_version=$CLI_VERSION"
             echo "cli_sha256=$CLI_SHA256"
-            echo "cli_ref=$CLI_REF"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved ${{ matrix.variant }} CLI -> $CLI_VERSION${CLI_REF:+ @ $CLI_REF}"
+          echo "Resolved ${{ matrix.variant }} CLI -> $CLI_VERSION"
 
           # The base is the same pre-beta variant the release channel builds
           # from. Pin the *index* (manifest-list) digest, not one arch's
@@ -259,7 +209,6 @@ jobs:
             VARIANT=${{ matrix.variant }}
             CLI_VERSION=${{ steps.meta.outputs.cli_version }}
             CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
-            CLI_REF=${{ steps.meta.outputs.cli_ref }}
           cache-from: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }}
           cache-to: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }},mode=max
           provenance: false
@@ -271,7 +220,6 @@ jobs:
         env:
           IMAGE: openab-pty:nightly-candidate
           CLI_VERSION: ${{ steps.meta.outputs.cli_version }}
-          CLI_REF: ${{ steps.meta.outputs.cli_ref }}
         run: |
           set -euo pipefail
 
@@ -331,14 +279,6 @@ jobs:
             devin)       GOT="$(docker exec pty devin --version)" ;;
             gemini)      GOT="$(docker exec pty gemini --version)" ;;
             grok)        GOT="$(docker exec pty grok --version)" ;;
-            hermes)
-              HEAD=$(docker exec pty git -c safe.directory=/usr/local/lib/hermes-agent \
-                -C /usr/local/lib/hermes-agent rev-parse HEAD)
-              [ "$HEAD" = "$CLI_REF" ] || {
-                echo "FAIL: Hermes checkout is $HEAD, expected resolved release commit $CLI_REF" >&2
-                exit 1
-              }
-              GOT="$CLI_VERSION @ $HEAD ($(docker exec pty hermes-acp --version))" ;;
             kiro)        GOT="$(docker exec pty kiro-cli --version)" ;;
             mimocode)    GOT="$(docker exec pty mimo --version)" ;;
             opencode)    GOT="$(docker exec pty opencode --version)" ;;
@@ -375,7 +315,6 @@ jobs:
             VARIANT=${{ matrix.variant }}
             CLI_VERSION=${{ steps.meta.outputs.cli_version }}
             CLI_SHA256=${{ steps.meta.outputs.cli_sha256 }}
-            CLI_REF=${{ steps.meta.outputs.cli_ref }}
           cache-from: type=gha,scope=nightly-${{ matrix.variant }}-${{ matrix.arch }}
           provenance: false
 
@@ -421,7 +360,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
-                  grok, hermes, kiro, mimocode, opencode, pi]
+                  grok, kiro, mimocode, opencode, pi]
     permissions:
       contents: read
       packages: write

@@ -2,5 +2,3 @@ dist/
 .build/
 target/
 *.xcodeproj
-
-.nightly-hermes-install.sh
