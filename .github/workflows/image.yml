@@ -114,7 +114,7 @@ jobs:
       # `load` also means pull requests now run the smoke test, which they
       # previously skipped for want of a pushed image to pull.
       - name: Build into the local daemon
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           # linux/amd64 only. Both deployment targets are amd64, and an arm64 leg
