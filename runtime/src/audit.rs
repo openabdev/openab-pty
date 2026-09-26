@@ -43,6 +43,11 @@ pub enum AuditKind {
     TakeoverAnomaly,
     Tier1SurvivorDetected,
     TokenRevoked,
+    ToolsGrantMinted,
+    ToolsGrantRevoked,
+    ToolsAuthFailure,
+    ToolsAttach,
+    ToolsDetach,
 }
 
 /// One redacted audit record. `credential_fingerprint` is derived only from a
@@ -82,6 +87,13 @@ impl AuditEvent {
     pub fn session(mut self, session: &SessionName, generation: Generation) -> Self {
         self.session = Some(session.as_str().to_owned());
         self.generation = Some(generation.0);
+        self
+    }
+
+    /// Session without a generation: the tools plane is keyed by name only, a
+    /// grant outliving a restart-in-place on purpose.
+    pub fn session_name(mut self, session: &SessionName) -> Self {
+        self.session = Some(session.as_str().to_owned());
         self
     }
 

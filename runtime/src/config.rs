@@ -73,6 +73,14 @@ pub struct PtyConfig {
     /// before this existed. The runtime does not fetch these: something with
     /// credentials puts them there, and this only applies them. See `crate::seed`.
     pub seed_dir: String,
+    /// Loopback address for the tools MCP listener (`POST /mcp/{session}/{key}`),
+    /// the endpoint a coding CLI in a session reaches a reverse-attached Mac
+    /// through. Empty (the default) disables the tools plane entirely: no
+    /// listener, and `/tools/attach` refuses every upgrade. Must be loopback;
+    /// this surface is unauthenticated by design and its boundary is the pod.
+    pub tools_listen: String,
+    /// Lifetime of a tools-attach grant minted by the admin plane.
+    pub tools_attach_ttl: Duration,
 }
 
 const PTY_KEYS: &[&str] = &[
@@ -90,6 +98,8 @@ const PTY_KEYS: &[&str] = &[
     "admin_credential_hash",
     "kill_domain_tier",
     "seed_dir",
+    "tools_listen",
+    "tools_attach_ttl",
 ];
 
 /// Parse and fail-closed validate a delivered PTY projection.
@@ -155,6 +165,8 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         filter_terminal_responses: bool_with_default(pty, "filter_terminal_responses", true)?,
         admin_credential_hash: raw_hash,
         seed_dir: string_with_default(pty, "seed_dir", "")?.to_string(),
+        tools_listen: string_with_default(pty, "tools_listen", "")?.to_string(),
+        tools_attach_ttl: duration_with_default(pty, "tools_attach_ttl", "1h")?,
         kill_domain_requirement: parse_kill_domain(string_with_default(
             pty,
             "kill_domain_tier",
@@ -368,6 +380,19 @@ fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
         return Err(Error::Config(
             "absolute_session_ttl must not be shorter than detached_idle_ttl".into(),
         ));
+    }
+    if config.tools_attach_ttl.is_zero() {
+        return Err(Error::Config("tools_attach_ttl must be non-zero".into()));
+    }
+    if !config.tools_listen.is_empty() && !crate::server::bind_is_loopback(&config.tools_listen) {
+        // Fail closed. The tools listener carries no credential of its own: its
+        // whole boundary is "only this pod can reach it", which a non-loopback
+        // bind silently removes.
+        return Err(Error::Config(format!(
+            "tools_listen ({}) must bind loopback: the tools MCP surface is unauthenticated and \
+             may only be reachable from inside the pod",
+            config.tools_listen
+        )));
     }
     Ok(())
 }

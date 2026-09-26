@@ -105,6 +105,12 @@ ENV HOME=/workspace \
     # Empty means no seeding, which is what every deployment did before this
     # existed. A deployment opts in by pointing this at a directory another
     # container has filled with *.tar.gz; this image fetches nothing itself.
-    PTY_SEED_DIR=""
+    PTY_SEED_DIR="" \
+    # Reverse-attached tools plane, off by default. Set to a loopback address
+    # (e.g. 127.0.0.1:8091) to let a Mac lend its instance-mcp tools to a session
+    # through GET /tools/attach/{session}; the CLI then finds them at the URL in
+    # OPENAB_TOOLS_MCP_URL. Off means: no listener, and /tools/attach refuses.
+    PTY_TOOLS_LISTEN="" \
+    PTY_TOOLS_ATTACH_TTL=1h
 
 ENTRYPOINT ["/usr/local/bin/openab-pty-entrypoint"]

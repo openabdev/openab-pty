@@ -1,0 +1,43 @@
+# Opt-in: deny the pod any egress onto the tailnet.
+#
+# You do NOT need this in the intended deployment, where the node itself is not
+# a tailnet member. There, the pod's only tailnet identity is the sidecar, which
+# is inbound-only, and the shell has no path to any tailnet address at all. This
+# was measured (openabdev/openab-pty#37): with the node's tailscaled stopped,
+# every tailnet target from the shell timed out; with it running, the shell
+# reached every peer as the node.
+#
+# Apply this when the k8s node runs `tailscaled` — typical for a homelab k3s box.
+# In that shape the pod's default route goes through the host's tailscale
+# routing table (`ip rule … lookup 52` → tailscale0, masqueraded as the node), and
+# the sidecar being inbound-only is true but insufficient. This policy closes
+# that path at the CNI. k3s ships kube-router's network-policy controller, so it
+# is enforced there; on other CNIs confirm NetworkPolicy support first.
+#
+# The policy is egress-only and allows everything except the tailnet ranges, so
+# cluster DNS, image-adjacent traffic, and the internet keep working. Inbound
+# (tailnet → sidecar → loopback) is unaffected: it does not traverse the pod's
+# egress rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openab-pty-no-tailnet-egress
+  namespace: openab-pty
+spec:
+  podSelector:
+    matchLabels:
+      app: openab-pty
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Tailscale's CGNAT range: every IPv4 tailnet address.
+              - 100.64.0.0/10
+    - to:
+        - ipBlock:
+            cidr: ::/0
+            except:
+              # Tailscale's IPv6 ULA range.
+              - fd7a:115c:a1e0::/48

@@ -24,7 +24,7 @@ fi
 die() { echo "openab-pty-entrypoint: $1" >&2; exit 64; }
 
 for var in PTY_LISTEN PTY_COMMAND PTY_ABSOLUTE_TTL PTY_IDLE_TTL PTY_TOKEN_TTL \
-           PTY_ADMIN_HASH PTY_SEED_DIR PTY_CONFIG_DIR; do
+           PTY_ADMIN_HASH PTY_SEED_DIR PTY_CONFIG_DIR PTY_TOOLS_LISTEN PTY_TOOLS_ATTACH_TTL; do
     case ${!var:-} in
         *'"'* | *'\'* | *$'\n'*)
             die "$var must not contain a quote, backslash or newline: it is interpolated into config.toml" ;;
@@ -71,6 +71,10 @@ scrollback_replay = false
 filter_terminal_responses = ${PTY_FILTER_TERMINAL_RESPONSES}
 admin_credential_hash = "${PTY_ADMIN_HASH}"
 seed_dir = "${PTY_SEED_DIR:-}"
+# Reverse-attached tools (a Mac lends its instance-mcp tools to one session).
+# Empty disables the plane; the runtime refuses anything but loopback here.
+tools_listen = "${PTY_TOOLS_LISTEN:-}"
+tools_attach_ttl = "${PTY_TOOLS_ATTACH_TTL:-1h}"
 EOF
 
 # Fail before serving rather than after: the same validator the runtime applies

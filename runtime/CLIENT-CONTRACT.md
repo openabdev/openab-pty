@@ -196,6 +196,7 @@ cannot make it for you without ceasing to be a terminal.
 | 4007 | capacity or admission bound | show the limit; do not auto-retry hard |
 | 4008 | operator killed it | say so plainly |
 | 4009 | internal fault | do not invite retry-create |
+| 4010 | tools grant revoked (tools socket only, §9) | the session lives; the lent Mac was withdrawn |
 | **1006** | **the browser/WS layer never opened** | see below |
 
 `1006` is not ours. It is what a client reports when the upgrade itself was
@@ -254,3 +255,157 @@ small-packet TCP over WiFi.
 Steps 1–6 are "works". Steps 7–8 are "feels good". Never silently swallow input
 into a closed socket — that presented as data corruption when the real cause was
 a takeover.
+
+## 9. Tools attach — a Mac lends its tools to one session
+
+This section is for a **different client**: not the terminal, but the machine
+whose tools a coding CLI inside a session should be able to call — in practice
+`oab-instance-mcp` on a Mac. Design of record:
+[reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md).
+The rule that shaped it: **the pod initiates nothing.** The Mac dials in, the pod
+stores only a hash, and the CLI talks to a loopback URL with no credential in it.
+
+```
+  CLI in session S                  runtime                              Mac
+  POST $OPENAB_TOOLS_MCP_URL  ──►  mux by JSON-RPC id  ◄── WS /tools/attach/S ◄── dials in
+  (http://127.0.0.1:8091/mcp/S/<key>)                      Authorization: Bearer <secret>
+```
+
+Three parties, three credentials, none shared:
+
+| Party | Holds | Gets it from |
+|---|---|---|
+| operator (Connect / Remote, or a curl) | admin credential | §1 |
+| the Mac | attach **secret** for one session | operator, out of band, after `POST …/tools-attach` |
+| the CLI in the session | per-session loopback **key**, inside the URL | its own environment, set at spawn |
+
+The plane is off unless the deployment sets `tools_listen` (image env
+`PTY_TOOLS_LISTEN`). Off means: no loopback listener, `/tools/attach` refuses
+every upgrade with `401`, and the mint endpoint returns `501`.
+
+### 9.1 Admin: mint and revoke
+
+```
+POST   /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin-credential>
+DELETE /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin-credential>
+```
+
+`POST` → `201`:
+
+```json
+{ "session": "laptop",
+  "secret": "b1f0…64 lowercase hex…",
+  "verifier": "sha256:…",
+  "expires_in_secs": 3600,
+  "attach": "/tools/attach/laptop" }
+```
+
+- `secret` is returned **once**. The runtime keeps only `verifier`. Hand the secret
+  to the Mac; do not store it anywhere the runtime can see.
+- Minting again **rotates** the secret and resets the TTL. A Mac already attached
+  stays attached; a Mac that redials must present the new secret. This is how a
+  grant is renewed: mint before expiry, hand over the new secret.
+- `404` if the session does not exist; `501` if the plane is off.
+- TTL is `tools_attach_ttl` (default `1h`, env `PTY_TOOLS_ATTACH_TTL`).
+
+`DELETE` → `204` always (once the name parses). It drops the grant and closes any
+attached Mac with **`4010`**. Revoking nothing is not an error.
+
+`GET /admin/sessions` gains a `tools` object keyed by session:
+
+```json
+"tools": { "laptop": { "granted": true, "grant_expires_in_secs": 3412,
+                        "attached": true, "peer": "100.74.35.49:53102" } }
+```
+
+### 9.2 The Mac: `GET /tools/attach/{session}`
+
+WebSocket upgrade with `Authorization: Bearer <secret>`. Same anti-enumeration rule as `/pty`: a missing session,
+a wrong secret, an expired grant and a disabled plane are all an indistinguishable
+`401`, counted against the same per-source upgrade throttle (`429` after five in
+a minute).
+
+Once upgraded, **the Mac is the MCP server and the runtime is its MCP client.**
+Text frames carry plain MCP JSON-RPC, no envelope:
+
+1. The runtime sends `initialize` (`protocolVersion` `2025-06-18`, `clientInfo`
+   `openab-pty`). Answer it; the `serverInfo` you return is what `instance_status`
+   reports to the CLI. The runtime then sends `notifications/initialized`.
+2. Every `tools/list`, `tools/call` and any other request the CLI issues arrives
+   with a runtime-assigned integer `id`. Reply with the same `id`. Ids are
+   rewritten on both sides; never assume they match the CLI's.
+3. The runtime pings every 20 s and closes after three intervals with no inbound
+   frame. Answer WS pings (any library does); nothing else is required.
+4. Notifications you send (e.g. `notifications/tools/list_changed`) are accepted
+   and dropped — there is no push channel toward the CLI. Requests you send are
+   answered `-32601` except `ping`.
+5. Frames up to 16 MiB are accepted from the Mac (screenshots are large). The
+   runtime holds at most 64 requests in flight per session and answers the CLI
+   with a JSON-RPC error after 120 s without your reply; you are not told.
+
+**One Mac per session.** A second upgrade for the same session **replaces** the
+first, which is closed with `4002`. A dialer that redials on disconnect therefore
+converges instead of fighting an incumbent; this is deliberate, and the reason is
+in the 4a spike (openabdev/openab-pty#37): two dialers on one session produced 418
+failed attaches in minutes.
+
+Close codes you will see on this socket:
+
+| Code | Meaning | Dialer action |
+|---|---|---|
+| 4001 | the grant's TTL elapsed | stop; a human must mint again |
+| 4002 | replaced by a newer attach for this session | stop; the newer one is you or a peer |
+| 4004 | the session ended (killed, exited, expired) | stop; nothing to attach to |
+| 4006 | runtime replaced (pod/task) | back off, redial while the grant should still be valid; the verifier is gone with the pod, so expect `401` until re-minted |
+| 4010 | grant revoked by the admin plane | stop |
+| 1000 | you closed, or the socket dropped | redial with backoff while the grant is valid |
+
+Retry ownership is yours: redial for the remainder of the grant, with backoff,
+and give up on any 4xxx except 4006. The pod cannot reach you.
+
+### 9.3 The CLI: `$OPENAB_TOOLS_MCP_URL`
+
+Every session child is spawned with
+
+```
+OPENAB_TOOLS_MCP_URL=http://127.0.0.1:<tools port>/mcp/<session>/<64-hex key>
+```
+
+Point the CLI's MCP config at it as a Streamable HTTP server. The runtime does not
+edit any CLI's config; whatever installs the CLI does that. Properties:
+
+- `POST` one JSON-RPC object → one JSON response, `200`. A notification → `202`,
+  empty body. `GET` → `405`: there is no server-to-client stream, and saying so
+  beats holding an SSE connection that never carries a frame.
+- Wrong or missing key, or unknown session → `404`, indistinguishable, so a caller
+  cannot enumerate sessions. `GET /healthz` → `ok`.
+- `initialize` is answered **locally** by the runtime (`serverInfo.name`
+  `openab-pty-tools`), attached or not, with `instructions` that say which.
+- `tools/list` returns the Mac's tools **plus** `instance_status`, a tool the
+  runtime answers itself. When nothing is attached the list is exactly
+  `[instance_status]` — not empty, not an error — so an agent can tell "no hands
+  were lent" from "the endpoint is broken".
+- `tools/call instance_status` →
+  `{"attached": true, "peer": …, "server": {serverInfo}, "grant_expires_in_secs": …}`
+  or `{"attached": false, "grant_pending": bool}`.
+- `tools/call <anything else>` while not attached → a **tool** result with
+  `isError: true` and a message telling the agent to ask the human, rather than a
+  protocol error that would make an MCP client tear the server down.
+- Mac unreachable mid-call → JSON-RPC error `-32001` (not attached), `-32002`
+  (too many in flight), `-32003` (timeout). The socket is torn down and the next
+  `tools/list` is back to `[instance_status]`.
+- The key is the session's; a restart-in-place spawns a new shell with a new key,
+  and the old one stops working. The listener is loopback-bound and the runtime
+  refuses to start otherwise — but it **is** reachable from the tailnet through
+  the sidecar like every other loopback port, which is why the key exists.
+
+### 9.4 Minimum viable lender
+
+1. Operator: `POST /admin/sessions/{s}/tools-attach`, hand `secret` to the Mac.
+2. Mac: open `ws(s)://<runtime>/tools/attach/{s}` with `Authorization: Bearer <secret>`.
+3. Mac: answer `initialize`, then serve `tools/list` / `tools/call` as an MCP server.
+4. Mac: on close 1000/4006 redial with backoff while the grant is valid; on any
+   other 4xxx stop.
+5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
+
+The CLI side is zero steps: the URL is already in its environment.

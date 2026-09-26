@@ -92,6 +92,13 @@ flowchart TB
 | Credential | long-lived admin credential, checked against a `sha256:` hash | short-lived per-session token, minted by the admin plane |
 | Held by | the operator's client | whatever attaches, once |
 
+A third, optional plane lets a Mac **lend its `oab-instance-mcp` tools to one
+session** by dialling in (`WS /tools/attach/{session}`, per-session secret minted
+by the admin plane); the coding CLI inside the session reaches them through a
+loopback MCP URL in its environment. The pod initiates nothing and stores only a
+hash. §9 of the client contract has the wire shape; the design is
+[reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md).
+
 A session shell *can* reach the listener over loopback, so the split is what keeps
 a compromised shell from managing its siblings: the shell never holds the admin
 credential, and an attach token authorises exactly one session and expires.

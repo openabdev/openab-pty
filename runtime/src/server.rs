@@ -36,6 +36,7 @@ use crate::session::{
     AttachedConnection, ControlEvent, InputError, OutboundItem, SessionManager, WindowSize,
 };
 use crate::token::AttachVerifier;
+use crate::tools::{self, ToolsHub};
 use crate::{Error, SessionName};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
@@ -460,6 +461,8 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     /// TTL maintenance interval.
     pub tick_interval: Duration,
+    /// Lifetime of a tools-attach grant (`POST /admin/sessions/{s}/tools-attach`).
+    pub tools_attach_ttl: Duration,
 }
 
 impl Default for ServerConfig {
@@ -469,6 +472,7 @@ impl Default for ServerConfig {
             tls_terminated_upstream: true,
             drain_grace: Duration::from_secs(3),
             tick_interval: Duration::from_secs(1),
+            tools_attach_ttl: tools::DEFAULT_TOOLS_ATTACH_TTL,
         }
     }
 }
@@ -484,6 +488,10 @@ pub struct AppState {
     pub admin: AdminAuthenticator,
     pub audit: AuditLogger,
     pub config: ServerConfig,
+    /// Reverse-attached tools: grants, live Mac sockets, loopback keys. Present
+    /// even when `tools_listen` is unset, so the admin plane can answer
+    /// consistently; without a listener nothing can call through it.
+    pub tools: Arc<ToolsHub>,
     pub abuse: AbuseMetrics,
     pub upgrades: UpgradeFailureLimiter,
     /// Set once shutdown begins: new attaches and creates are refused so the
@@ -499,12 +507,14 @@ impl AppState {
         audit: AuditLogger,
         config: ServerConfig,
     ) -> Arc<Self> {
+        let tools = Arc::new(ToolsHub::new(config.tools_attach_ttl, audit.clone()));
         Arc::new(Self {
             manager,
             verifier,
             admin,
             audit,
             config,
+            tools,
             abuse: AbuseMetrics::default(),
             upgrades: UpgradeFailureLimiter::default(),
             draining: AtomicBool::new(false),
@@ -535,10 +545,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/sessions/{session}", delete(admin_kill))
         .route("/admin/sessions/{session}/renew", post(admin_renew))
         .route("/admin/sessions/{session}/restart", post(admin_restart))
+        .route(
+            "/admin/sessions/{session}/tools-attach",
+            post(admin_tools_mint).delete(admin_tools_revoke),
+        )
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES));
     Router::new()
         .route("/pty/{session}", get(attach))
+        .route("/tools/attach/{session}", get(tools_attach))
         .merge(admin)
+        .with_state(state)
+}
+
+/// The loopback-only tools surface. A **separate** listener from the one above,
+/// bound to `tools_listen`, because it carries no credential: putting it on the
+/// tailnet-reachable listener would hand every tailnet peer the session's Mac.
+pub fn tools_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route(
+            "/mcp/{session}/{key}",
+            post(tools_loopback).get(tools_loopback_no_stream),
+        )
+        .layer(DefaultBodyLimit::max(tools::MAX_LOOPBACK_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1037,6 +1066,7 @@ async fn admin_list(
         // guarantee is labelled everywhere it is surfaced, never implied.
         "kill_domain": state.manager.kill_domain().status(),
         "draining": state.is_draining(),
+        "tools": state.tools.summary(),
         "metrics": {
             "sessions_created": metrics.sessions_created.load(Ordering::Relaxed),
             "admission_rejected": metrics.admission_rejected.load(Ordering::Relaxed),
@@ -1132,9 +1162,214 @@ async fn admin_kill(
         Err(error) => return error_response(&error),
     };
     match state.manager.kill(&name).await {
-        Ok(report) => Json(report).into_response(),
+        Ok(report) => {
+            state.tools.forget_session(&name);
+            Json(report).into_response()
+        }
         Err(error) => error_response(&error),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tools: reverse attach (inbound WS from a Mac) and the loopback MCP surface
+// ---------------------------------------------------------------------------
+
+/// `GET /tools/attach/{session}` — a Mac dials in with the secret minted by
+/// `POST /admin/sessions/{session}/tools-attach`. Same bearer transport and the
+/// same indistinguishable-401 discipline as `/pty/{session}`.
+async fn tools_attach(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let source = peer.ip();
+    if let Err(retry_after) = state.upgrades.check(source) {
+        AbuseMetrics::bump(&state.abuse.upgrade_bans);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after.as_secs().max(1).to_string())],
+        )
+            .into_response();
+    }
+    if state.is_draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime is draining for shutdown",
+        )
+            .into_response();
+    }
+    let rejected = |state: &Arc<AppState>| {
+        AbuseMetrics::bump(&state.abuse.upgrade_failures);
+        if state.upgrades.record_failure(source) {
+            AbuseMetrics::bump(&state.abuse.upgrade_bans);
+            tracing::warn!(%source, "banning source after repeated tools-attach failures");
+        }
+        StatusCode::UNAUTHORIZED.into_response()
+    };
+    // No listener, no plane: a grant cannot even be minted without one (the
+    // admin route checks the same), so this is belt and braces.
+    if state.manager.tools_hub().is_none() {
+        return rejected(&state);
+    }
+    let Some(token) = ws_bearer_token(&headers) else {
+        return rejected(&state);
+    };
+    if token.is_empty() || token.len() > MAX_ATTACH_TOKEN_BYTES {
+        return rejected(&state);
+    }
+    let Ok(name) = SessionName::parse(&session) else {
+        return rejected(&state);
+    };
+    if state.manager.get(&name).is_none() {
+        return rejected(&state);
+    }
+    let mut presented = SecretBytes::from_slice(token.as_bytes());
+    let peer_label = peer.to_string();
+    if state
+        .tools
+        .verify(&name, &mut presented, &peer_label)
+        .is_err()
+    {
+        return rejected(&state);
+    }
+    state.upgrades.on_success(source);
+    let hub = state.tools.clone();
+    upgrade
+        .max_message_size(tools::MAX_MAC_FRAME_BYTES)
+        .max_frame_size(tools::MAX_MAC_FRAME_BYTES)
+        .on_upgrade(move |socket| async move {
+            hub.serve_attached(name, socket, peer_label).await;
+        })
+}
+
+/// `POST /admin/sessions/{session}/tools-attach` — mint the secret a Mac will
+/// present on `/tools/attach/{session}`. Returned once; the runtime keeps the
+/// hash. Minting again rotates the secret and leaves a live attach in place.
+async fn admin_tools_mint(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
+        return response;
+    }
+    let name = match SessionName::parse(&session) {
+        Ok(name) => name,
+        Err(error) => return error_response(&error),
+    };
+    if state.manager.get(&name).is_none() {
+        return error_response(&Error::NotFound(name));
+    }
+    if state.manager.tools_hub().is_none() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": "tools plane disabled: set [pty].tools_listen" })),
+        )
+            .into_response();
+    }
+    match state.tools.mint(&name) {
+        Ok(mut minted) => {
+            let secret = String::from_utf8_lossy(minted.plaintext.as_bytes()).into_owned();
+            minted.plaintext.zeroize();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "session": name.as_str(),
+                    "secret": secret,
+                    "verifier": minted.verifier,
+                    "expires_in_secs": minted
+                        .expires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_secs(),
+                    "attach": format!("/tools/attach/{}", name.as_str()),
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => error_response(&error),
+    }
+}
+
+/// `DELETE /admin/sessions/{session}/tools-attach` — drop the grant and close
+/// any attached Mac with `TOOLS_REVOKED`. 204 either way once the name parses:
+/// revoking nothing is not an error the caller can act on.
+async fn admin_tools_revoke(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
+        return response;
+    }
+    let name = match SessionName::parse(&session) {
+        Ok(name) => name,
+        Err(error) => return error_response(&error),
+    };
+    state.tools.revoke(&name, close_code::TOOLS_REVOKED);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /mcp/{session}/{key}` on the loopback listener: one JSON-RPC message
+/// from the CLI, one JSON response (or `202` for a notification). Streamable
+/// HTTP without the SSE half: every call here has exactly one answer.
+async fn tools_loopback(
+    State(state): State<Arc<AppState>>,
+    Path((session, key)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Unknown session and wrong key are the same 404: a same-pod caller must not
+    // be able to enumerate sessions by probing.
+    let Ok(name) = SessionName::parse(&session) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if state.manager.get(&name).is_none() || !state.tools.check_loopback_key(&name, &key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(tools::rpc_error(
+                    Value::Null,
+                    -32600,
+                    "expected a single JSON-RPC object",
+                )),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(tools::rpc_error(
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {error}"),
+                )),
+            )
+                .into_response()
+        }
+    };
+    match state.tools.handle_loopback(&name, request).await {
+        Some(response) => Json(response).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// `GET /mcp/...` is the Streamable HTTP server-push stream. There is nothing to
+/// push — the Mac's notifications are not relayed — so say so rather than hold
+/// an SSE connection open that will never carry a frame.
+async fn tools_loopback_no_stream() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [("allow", "POST")],
+        "this MCP endpoint answers POST only; it has no server-to-client stream",
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,12 +1404,74 @@ pub async fn serve<S>(
 where
     S: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_with_tools(state, listener, None, shutdown).await
+}
+
+/// Bind the tools loopback listener, re-checking that the address the kernel
+/// actually gave us is loopback. Config validation already refused anything
+/// else; this is the check that survives a config-layer bug.
+pub async fn bind_tools(listen: &str) -> Result<tokio::net::TcpListener, Error> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(Error::Io)?;
+    let local = listener.local_addr().map_err(Error::Io)?;
+    if !local.ip().is_loopback() {
+        return Err(Error::Config(format!(
+            "refusing to serve tools on {local}: the tools MCP listener must be loopback"
+        )));
+    }
+    Ok(listener)
+}
+
+/// Like [`serve`], with the optional loopback tools listener. When present, the
+/// session manager is wired so every new child receives `OPENAB_TOOLS_MCP_URL`.
+pub async fn serve_with_tools<S>(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    tools_listener: Option<tokio::net::TcpListener>,
+    shutdown: S,
+) -> Result<(), Error>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
     let ticker = spawn_ticker(state.clone());
+
+    let (tools_stop_tx, tools_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let tools_task = match tools_listener {
+        Some(tools_listener) => {
+            let local = tools_listener.local_addr().map_err(Error::Io)?;
+            state
+                .manager
+                .set_tools_endpoint(crate::session::ToolsEndpoint {
+                    hub: state.tools.clone(),
+                    base_url: format!("http://{local}"),
+                });
+            tracing::info!(
+                tools_listen = %local,
+                "tools plane enabled: loopback POST /mcp/{{session}}/{{key}}; Macs dial in on \
+                 GET /tools/attach/{{session}}"
+            );
+            let router = tools_router(state.clone());
+            Some(tokio::spawn(async move {
+                axum::serve(tools_listener, router)
+                    .with_graceful_shutdown(async move {
+                        let _ = tools_stop_rx.await;
+                    })
+                    .await
+            }))
+        }
+        None => {
+            drop(tools_stop_rx);
+            None
+        }
+    };
 
     let drain_state = state.clone();
     let graceful = async move {
         shutdown.await;
         drain_state.begin_drain();
+        let _ = tools_stop_tx.send(());
+        drain_state.tools.close_all(close_code::RUNTIME_REPLACED);
         let grace = drain_state.config.drain_grace;
         tracing::info!(
             grace_secs = grace.as_secs(),
@@ -1202,6 +1499,9 @@ where
     .map_err(Error::Io);
 
     ticker.abort();
+    if let Some(task) = tools_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
     result
 }
 
@@ -1281,6 +1581,8 @@ fn spawn_ticker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             for action in state.manager.tick().await {
                 tracing::info!(?action, "ttl maintenance");
             }
+            let manager = state.manager.clone();
+            state.tools.sweep(|name| manager.get(name).is_some());
         }
     })
 }

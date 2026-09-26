@@ -235,7 +235,9 @@ async fn run(projection: PtyConfig) -> Result<()> {
         tls_terminated_upstream,
         drain_grace: Duration::from_secs(3),
         tick_interval: Duration::from_secs(1),
+        tools_attach_ttl: projection.tools_attach_ttl,
     };
+    let tools_listen = projection.tools_listen.clone();
 
     let manager = SessionManager::new(projection, policy, tokens, audit.clone(), kill, spawner)
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -255,8 +257,20 @@ async fn run(projection: PtyConfig) -> Result<()> {
         "openab-pty listening: GET /pty/{{session}} attaches, /admin/* is the whole admin plane"
     );
 
+    // Loopback-only, re-checked on the bound address. Disabled unless configured:
+    // an unauthenticated surface is not something to enable by default.
+    let tools_listener = if tools_listen.is_empty() {
+        None
+    } else {
+        Some(
+            server::bind_tools(&tools_listen)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        )
+    };
+
     let state = AppState::new(manager, verifier, admin, audit, server_config);
-    server::serve(state, listener, shutdown_signal())
+    server::serve_with_tools(state, listener, tools_listener, shutdown_signal())
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     tracing::info!("openab-pty stopped");

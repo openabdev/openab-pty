@@ -988,7 +988,21 @@ pub struct SessionManager {
     spawner: Arc<dyn PtySpawner>,
     metrics: Metrics,
     epoch: Instant,
+    /// Set once the tools listener is bound. Every child spawned afterwards
+    /// receives `OPENAB_TOOLS_MCP_URL`, its private loopback MCP endpoint.
+    tools: Mutex<Option<ToolsEndpoint>>,
 }
+
+/// Where a session's coding CLI finds its reverse-attached Mac.
+pub struct ToolsEndpoint {
+    pub hub: Arc<crate::tools::ToolsHub>,
+    /// `http://127.0.0.1:<port>` — the bound loopback address, never the config
+    /// string (which may say port 0).
+    pub base_url: String,
+}
+
+/// Environment variable that carries the session's tools MCP URL to the CLI.
+pub const TOOLS_URL_ENV: &str = "OPENAB_TOOLS_MCP_URL";
 
 impl SessionManager {
     pub fn new(
@@ -1014,7 +1028,21 @@ impl SessionManager {
             spawner,
             metrics: Metrics::default(),
             epoch: Instant::now(),
+            tools: Mutex::new(None),
         }))
+    }
+
+    /// Wire the tools plane. Called after the loopback listener is bound, before
+    /// the first session exists; sessions created earlier get no URL.
+    pub fn set_tools_endpoint(&self, endpoint: ToolsEndpoint) {
+        *self.tools.lock() = Some(endpoint);
+    }
+
+    pub fn tools_hub(&self) -> Option<Arc<crate::tools::ToolsHub>> {
+        self.tools
+            .lock()
+            .as_ref()
+            .map(|endpoint| endpoint.hub.clone())
     }
 
     pub fn policy(&self) -> &SessionPolicy {
@@ -1155,11 +1183,22 @@ impl SessionManager {
         generation: Generation,
     ) -> Result<SessionCredential, Error> {
         let mut containment = self.kill.open_session(&name, generation)?;
-        let env = child_env(
+        let mut env = child_env(
             std::env::vars(),
             &self.workspace().to_string_lossy(),
             Some(DEFAULT_TERM),
         );
+        // The per-session loopback key is issued here, at spawn, so the URL in the
+        // child's environment is the only place it ever exists in plaintext. A
+        // restart-in-place rotates it with the shell.
+        if let Some(endpoint) = self.tools.lock().as_ref() {
+            let key = endpoint.hub.issue_loopback_key(&name);
+            env.retain(|(k, _)| k != TOOLS_URL_ENV);
+            env.push((
+                TOOLS_URL_ENV.to_string(),
+                format!("{}/mcp/{}/{}", endpoint.base_url, name.as_str(), key),
+            ));
+        }
         let request = SpawnRequest {
             session: name.clone(),
             command: self.config.command.clone(),

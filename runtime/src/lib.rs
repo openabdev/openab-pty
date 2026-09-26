@@ -34,6 +34,7 @@ pub mod server;
 pub mod session;
 pub mod termfilter;
 pub mod token;
+pub mod tools;
 
 use std::fmt;
 
@@ -105,6 +106,10 @@ pub mod close_code {
     /// An internal fault, not a client-correctable condition. Distinct from
     /// [`CAPACITY`], which invites an immediate retry-create.
     pub const INTERNAL_ERROR: u16 = 4009;
+    /// The admin plane revoked a tools-attach grant while a Mac was attached.
+    /// Distinct from [`TTL_EXPIRED`] and [`ADMIN_KILL`]: the session lives on,
+    /// only the lent hands were withdrawn. Tools socket only.
+    pub const TOOLS_REVOKED: u16 = 4010;
 }
 
 /// Errors surfaced across module boundaries.

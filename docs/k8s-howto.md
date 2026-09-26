@@ -32,6 +32,16 @@ and a read-only root filesystem.
   a real failure that has already happened elsewhere in this fleet — a new
   `<host>-N` device on every restart.
 - An admin credential pair.
+- **A node that is not itself a tailnet member.** This is an assumption the
+  design leans on, so it is stated rather than hoped for: the pod's sandbox
+  properties include "the shell has no path onto the tailnet", and that holds
+  because the sidecar is the pod's *only* tailnet identity and is inbound-only.
+  If the node runs `tailscaled` — typical for a homelab k3s box — the pod's
+  default route goes through the host's tailscale routing table and the shell
+  reaches every tailnet peer *as the node*, sidecar or not. Measured both ways
+  on the same pod (openabdev/openab-pty#37). If you must run on such a node,
+  apply [`deploy/k8s/networkpolicy-no-tailnet-egress.yaml`](../deploy/k8s/networkpolicy-no-tailnet-egress.yaml)
+  and verify with the probe in §4.
 
 ## 1. Generate the admin credential
 
@@ -107,6 +117,18 @@ pod-level — which is why the sidecar cannot use `TS_KUBE_SECRET` for state and
 uses `TS_STATE_DIR` instead. Enabling it for the sidecar would hand a token to the
 terminal container too.
 
+And the one property Kubernetes cannot promise for you — that the shell has no
+egress onto the tailnet:
+
+```bash
+# Pick any tailnet peer that is NOT this pod. Must time out, not connect.
+kubectl -n openab-pty exec openab-pty -c openab-pty -- \
+  sh -c 'curl -s -m 5 -o /dev/null -w "%{http_code}\n" http://100.64.0.1:22 || echo "no path (good)"'
+```
+
+If that connects, the node is on the tailnet (see Prerequisites) and the pod is
+riding its routes. Apply the opt-in NetworkPolicy and re-run until it times out.
+
 ## 5. Attach
 
 Point a client at the pod's tailnet address on port 8090 with the admin
@@ -116,6 +138,33 @@ credential. The wire protocol is [`../runtime/CLIENT-CONTRACT.md`](../runtime/CL
 ```bash
 tailscale status | grep openab-pty     # find the address
 ```
+
+## 6. Lending a Mac to a session (optional)
+
+With `PTY_TOOLS_LISTEN` set (the manifest sets `127.0.0.1:8091`), a Mac running
+`oab-instance-mcp` can **dial in** and lend its tools to one session; the coding
+CLI inside that session then finds them at the URL in `$OPENAB_TOOLS_MCP_URL`.
+The pod initiates nothing and stores only a hash. Design:
+[reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md);
+wire contract: §9 of [`../runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
+
+```bash
+# Mint a one-hour attach secret for session "laptop" (admin credential required).
+curl -s -X POST -H "Authorization: Bearer $CRED" \
+  http://<pod-tailnet-ip>:8090/admin/sessions/laptop/tools-attach
+# → {"secret":"…","verifier":"sha256:…","expires_in_secs":3600,"attach":"/tools/attach/laptop"}
+# Hand the secret to the Mac; it dials ws://<pod-tailnet-ip>:8090/tools/attach/laptop
+# with `Authorization: Bearer <secret>`. Revoke any time:
+curl -s -X DELETE -H "Authorization: Bearer $CRED" \
+  http://<pod-tailnet-ip>:8090/admin/sessions/laptop/tools-attach
+```
+
+No `tailscale serve` configuration is needed: the userspace sidecar forwards
+inbound tailnet TCP to every loopback port of the pod. The loopback tools port
+(8091) is reachable the same way from the tailnet — it answers only with a
+per-session key that exists solely in that session's environment, and a wrong or
+missing key is a `404`, so it leaks nothing — but treat it like the admin plane:
+the tailnet is the perimeter, not a public network.
 
 ## Failures worth knowing about in advance
 
