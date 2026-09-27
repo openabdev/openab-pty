@@ -399,6 +399,40 @@ edit any CLI's config; whatever installs the CLI does that. Properties:
   refuses to start otherwise — but it **is** reachable from the tailnet through
   the sidecar like every other loopback port, which is why the key exists.
 
+#### Wiring the URL into the coding CLI
+
+The runtime sets the env var; it does **not** edit the CLI's config. Whatever owns
+the session's workspace does that. For `kiro-cli` (2.13+), inside the session shell:
+
+```sh
+kiro-cli mcp add --name mac --url "$OPENAB_TOOLS_MCP_URL" --scope global
+```
+
+`mcp add` registers the server but does not trust its tools, so each call prompts.
+To pre-trust them, list them in the agent config's `allowedTools` under the
+`@<server>/<tool>` naming — for the `mac` server, `@mac/screenshot`,
+`@mac/browser_navigate`, … A `~/.kiro/agents/<agent>.json` with both the server and
+the allowlist means the agent starts with the Mac's tools already usable:
+
+```json
+{
+  "name": "kiro_default",
+  "mcpServers": { "mac": { "url": "http://127.0.0.1:<port>/mcp/<session>/<key>" } },
+  "allowedTools": ["@mac/screenshot", "@mac/mouse", "@mac/key", "@mac/osascript",
+                   "@mac/browser_navigate", "@mac/browser_snapshot", "@mac/browser_evaluate", "…"]
+}
+```
+
+Alternatively, per invocation: `kiro-cli chat --trust-tools=@mac/screenshot,@mac/browser_navigate,…`.
+Other CLIs use their own MCP config shape; the URL is the same plain loopback URL.
+
+**Caveat — the key rotates.** The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
+*generation*: a restart-in-place, or tearing down and re-lending a Mac, mints a new
+URL, and any config that hard-codes the old one (both `mcp.json` and the agent's
+`allowedTools` server entry) must be updated. Re-run `mcp add`, or read
+`$OPENAB_TOOLS_MCP_URL` again, after each re-lend. Injecting and refreshing this
+automatically at session spawn is [tracked as #39](https://github.com/openabdev/openab-pty/issues/39); until then it is a documented manual step.
+
 ### 9.4 Minimum viable lender
 
 1. Operator: `POST /admin/sessions/{s}/tools-attach`, hand `secret` to the Mac.
