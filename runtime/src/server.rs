@@ -461,7 +461,8 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     /// TTL maintenance interval.
     pub tick_interval: Duration,
-    /// Lifetime of a tools-attach grant (`POST /admin/sessions/{s}/tools-attach`).
+    /// Upper bound on a tools-attach grant (`POST /admin/sessions/{s}/tools-attach`).
+    /// The endpoint defaults an omitted `ttl_secs` to one hour.
     pub tools_attach_ttl: Duration,
 }
 
@@ -472,7 +473,7 @@ impl Default for ServerConfig {
             tls_terminated_upstream: true,
             drain_grace: Duration::from_secs(3),
             tick_interval: Duration::from_secs(1),
-            tools_attach_ttl: tools::DEFAULT_TOOLS_ATTACH_TTL,
+            tools_attach_ttl: tools::DEFAULT_TOOLS_ATTACH_MAX_TTL,
         }
     }
 }
@@ -1244,6 +1245,12 @@ async fn tools_attach(
         })
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ToolsMintRequest {
+    /// Optional lease requested by Connect/Remote. Missing stays one hour;
+    /// zero or above the operator ceiling is a 400, never silently capped.
+    ttl_secs: Option<u64>,
+}
 /// `POST /admin/sessions/{session}/tools-attach` — mint the secret a Mac will
 /// present on `/tools/attach/{session}`. Returned once; the runtime keeps the
 /// hash. Minting again rotates the secret and leaves a live attach in place.
@@ -1252,6 +1259,7 @@ async fn admin_tools_mint(
     ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     Path(session): Path<String>,
     headers: HeaderMap,
+    request: Option<Json<ToolsMintRequest>>,
 ) -> Response {
     if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
@@ -1270,7 +1278,24 @@ async fn admin_tools_mint(
         )
             .into_response();
     }
-    match state.tools.mint(&name) {
+    let max_ttl = state.tools.max_ttl();
+    let ttl = request
+        .and_then(|Json(body)| body.ttl_secs)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| tools::DEFAULT_TOOLS_ATTACH_TTL.min(max_ttl));
+    if ttl.is_zero() || ttl > max_ttl {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "ttl_secs must be between 1 and {} (configured tools_attach_ttl maximum)",
+                    max_ttl.as_secs()
+                )
+            })),
+        )
+            .into_response();
+    }
+    match state.tools.mint_with_ttl(&name, ttl) {
         Ok(mut minted) => {
             let secret = String::from_utf8_lossy(minted.plaintext.as_bytes()).into_owned();
             minted.plaintext.zeroize();
@@ -1284,6 +1309,7 @@ async fn admin_tools_mint(
                         .expires_at
                         .saturating_duration_since(Instant::now())
                         .as_secs(),
+                    "ttl_secs": ttl.as_secs(),
                     "attach": format!("/tools/attach/{}", name.as_str()),
                 })),
             )

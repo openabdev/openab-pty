@@ -111,6 +111,6 @@ ENV HOME=/workspace \
     # through GET /tools/attach/{session}; the CLI then finds them at the URL in
     # OPENAB_TOOLS_MCP_URL. Off means: no listener, and /tools/attach refuses.
     PTY_TOOLS_LISTEN="" \
-    PTY_TOOLS_ATTACH_TTL=1h
+    PTY_TOOLS_ATTACH_TTL=24h
 
 ENTRYPOINT ["/usr/local/bin/openab-pty-entrypoint"]

@@ -79,7 +79,9 @@ pub struct PtyConfig {
     /// listener, and `/tools/attach` refuses every upgrade. Must be loopback;
     /// this surface is unauthenticated by design and its boundary is the pod.
     pub tools_listen: String,
-    /// Lifetime of a tools-attach grant minted by the admin plane.
+    /// Upper bound on a tools-attach grant requested by the admin plane.
+    /// A request with no `ttl_secs` remains one hour; Connect/Remote may request
+    /// up to this operator-controlled ceiling.
     pub tools_attach_ttl: Duration,
 }
 
@@ -166,7 +168,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         admin_credential_hash: raw_hash,
         seed_dir: string_with_default(pty, "seed_dir", "")?.to_string(),
         tools_listen: string_with_default(pty, "tools_listen", "")?.to_string(),
-        tools_attach_ttl: duration_with_default(pty, "tools_attach_ttl", "1h")?,
+        tools_attach_ttl: duration_with_default(pty, "tools_attach_ttl", "24h")?,
         kill_domain_requirement: parse_kill_domain(string_with_default(
             pty,
             "kill_domain_tier",
@@ -384,6 +386,12 @@ fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
     if config.tools_attach_ttl.is_zero() {
         return Err(Error::Config("tools_attach_ttl must be non-zero".into()));
     }
+    if config.tools_attach_ttl > crate::tools::DEFAULT_TOOLS_ATTACH_MAX_TTL {
+        return Err(Error::Config(format!(
+            "tools_attach_ttl must not exceed the hard 24h lease maximum ({:?})",
+            crate::tools::DEFAULT_TOOLS_ATTACH_MAX_TTL
+        )));
+    }
     if !config.tools_listen.is_empty() && !crate::server::bind_is_loopback(&config.tools_listen) {
         // Fail closed. The tools listener carries no credential of its own: its
         // whole boundary is "only this pod can reach it", which a non-loopback
@@ -535,6 +543,14 @@ admin_credential_hash = "{HASH}"
                     "absolute_session_ttl = \"29m\"",
                 ),
                 "must not be shorter than detached_idle_ttl",
+            ),
+            (
+                format!("{}tools_attach_ttl = \"0s\"\n", valid()),
+                "tools_attach_ttl must be greater than zero",
+            ),
+            (
+                format!("{}tools_attach_ttl = \"25h\"\n", valid()),
+                "hard 24h lease maximum",
             ),
         ] {
             let error =

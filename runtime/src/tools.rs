@@ -65,9 +65,11 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 
-/// Default lifetime of a tools-attach grant. One hour is the "lend my Mac to
-/// this session" unit the Connect / Remote UI offers.
+/// Default lifetime when the mint request omits `ttl_secs`.
 pub const DEFAULT_TOOLS_ATTACH_TTL: Duration = Duration::from_secs(60 * 60);
+/// Default configured upper bound. Connect/Remote offer up to 24 hours; the
+/// operator can lower this with `[pty].tools_attach_ttl` / `PTY_TOOLS_ATTACH_TTL`.
+pub const DEFAULT_TOOLS_ATTACH_MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Bound on requests a session may have in flight toward its Mac. Past it the
 /// loopback caller gets a JSON-RPC error immediately rather than queueing.
 pub const MAX_INFLIGHT_PER_SESSION: usize = 64;
@@ -281,23 +283,25 @@ pub struct ToolsHub {
     /// when a session's child is spawned, so it exists before the CLI can ask.
     loopback_keys: Mutex<HashMap<SessionName, [u8; 32]>>,
     attached: Mutex<HashMap<SessionName, Arc<Attached>>>,
-    ttl: Duration,
+    max_ttl: Duration,
     audit: AuditLogger,
 }
 
 impl ToolsHub {
-    pub fn new(ttl: Duration, audit: AuditLogger) -> Self {
+    /// `max_ttl` is an operator ceiling, not the default lease. Requests that
+    /// omit `ttl_secs` remain one hour for backwards compatibility.
+    pub fn new(max_ttl: Duration, audit: AuditLogger) -> Self {
         Self {
             grants: Mutex::new(HashMap::new()),
             loopback_keys: Mutex::new(HashMap::new()),
             attached: Mutex::new(HashMap::new()),
-            ttl,
+            max_ttl,
             audit,
         }
     }
 
-    pub fn ttl(&self) -> Duration {
-        self.ttl
+    pub fn max_ttl(&self) -> Duration {
+        self.max_ttl
     }
 
     // -- grants -------------------------------------------------------------
@@ -306,12 +310,29 @@ impl ToolsHub {
     /// keeps its socket: renewal is "new secret, same connection", so a Mac that
     /// redials after the old secret expires is not evicted mid-grant.
     pub fn mint(&self, session: &SessionName) -> Result<MintedToolsAttach, Error> {
-        if self.ttl.is_zero() {
+        self.mint_with_ttl(session, DEFAULT_TOOLS_ATTACH_TTL.min(self.max_ttl))
+    }
+
+    /// Mint with the admin caller's requested lifetime. Refuse rather than cap:
+    /// a silent cap is exactly how a 12-hour Connect lease used to become one
+    /// hour while every layer reported success.
+    pub fn mint_with_ttl(
+        &self,
+        session: &SessionName,
+        ttl: Duration,
+    ) -> Result<MintedToolsAttach, Error> {
+        if ttl.is_zero() {
             return Err(Error::Other("tools attach TTL must be non-zero".into()));
+        }
+        if ttl > self.max_ttl {
+            return Err(Error::Other(format!(
+                "tools attach TTL exceeds configured maximum of {} seconds",
+                self.max_ttl.as_secs()
+            )));
         }
         let encoded = random_hex()?;
         let hash = sha256(&encoded);
-        let expires_at = Instant::now() + self.ttl;
+        let expires_at = Instant::now() + ttl;
         self.grants
             .lock()
             .insert(session.clone(), Grant { hash, expires_at });
@@ -319,7 +340,7 @@ impl ToolsHub {
             AuditEvent::new(AuditKind::ToolsGrantMinted)
                 .session_name(session)
                 .fingerprint(hash_fingerprint(&hash))
-                .detail(format!("ttl_secs={}", self.ttl.as_secs())),
+                .detail(format!("ttl_secs={}", ttl.as_secs())),
         );
         Ok(MintedToolsAttach {
             plaintext: SecretBytes::new(encoded),
@@ -860,11 +881,39 @@ mod tests {
     }
 
     #[test]
+    fn mint_uses_one_hour_by_default_and_honors_a_requested_ttl() {
+        let hub = ToolsHub::new(DEFAULT_TOOLS_ATTACH_MAX_TTL, AuditLogger);
+        let before = Instant::now();
+        let defaulted = hub.mint(&session("defaulted")).unwrap();
+        let default_lifetime = defaulted.expires_at.duration_since(before);
+        assert!(default_lifetime >= Duration::from_secs(3599));
+        assert!(default_lifetime <= Duration::from_secs(3601));
+
+        let before = Instant::now();
+        let requested = hub
+            .mint_with_ttl(&session("requested"), Duration::from_secs(2 * 60 * 60))
+            .unwrap();
+        let requested_lifetime = requested.expires_at.duration_since(before);
+        assert!(requested_lifetime >= Duration::from_secs(7199));
+        assert!(requested_lifetime <= Duration::from_secs(7201));
+    }
+
+    #[test]
+    fn mint_refuses_zero_and_over_the_operator_maximum_instead_of_capping() {
+        let hub = ToolsHub::new(Duration::from_secs(24 * 60 * 60), AuditLogger);
+        assert!(hub.mint_with_ttl(&session("zero"), Duration::ZERO).is_err());
+        assert!(hub
+            .mint_with_ttl(&session("over"), Duration::from_secs(24 * 60 * 60 + 1),)
+            .is_err());
+    }
+
+    #[test]
     fn a_secret_for_session_a_does_not_open_session_b() {
         let hub = ToolsHub::new(Duration::from_secs(60), AuditLogger);
         let a = session("a");
         let b = session("b");
         let minted = hub.mint(&a).unwrap();
+
         hub.mint(&b).unwrap();
         let mut presented = SecretBytes::new(minted.plaintext.as_bytes().to_vec());
         assert!(hub.verify(&b, &mut presented, "test").is_err());

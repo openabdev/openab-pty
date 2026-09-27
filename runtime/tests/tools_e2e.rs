@@ -138,14 +138,18 @@ tools_attach_ttl = "1h"
         body["token"].as_str().unwrap().to_owned()
     }
 
+    async fn mint_tools_response(&self, name: &str, ttl_secs: Option<u64>) -> (u16, Value) {
+        let body = ttl_secs.map(|ttl| format!(r#"{{"ttl_secs":{ttl}}}"#));
+        self.admin(
+            "POST",
+            &format!("/admin/sessions/{name}/tools-attach"),
+            body.as_deref(),
+        )
+        .await
+    }
+
     async fn mint_tools(&self, name: &str) -> String {
-        let (status, body) = self
-            .admin(
-                "POST",
-                &format!("/admin/sessions/{name}/tools-attach"),
-                None,
-            )
-            .await;
+        let (status, body) = self.mint_tools_response(name, None).await;
         assert_eq!(status, 201, "tools mint failed: {body}");
         assert!(body["verifier"].as_str().unwrap().starts_with("sha256:"));
         body["secret"].as_str().unwrap().to_owned()
@@ -387,6 +391,30 @@ async fn fake_mac(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "binds sockets and spawns a PTY child"]
+async fn tools_mint_honors_requested_ttl_and_rejects_invalid_values() {
+    let h = Harness::start(Duration::from_secs(24 * 60 * 60)).await;
+    h.create("lease").await;
+
+    let (status, defaulted) = h.mint_tools_response("lease", None).await;
+    assert_eq!(status, 201, "{defaulted}");
+    assert_eq!(defaulted["ttl_secs"], json!(3600));
+    assert!(defaulted["expires_in_secs"].as_u64().unwrap() >= 3599);
+
+    let (status, four_hours) = h.mint_tools_response("lease", Some(4 * 60 * 60)).await;
+    assert_eq!(status, 201, "{four_hours}");
+    assert_eq!(four_hours["ttl_secs"], json!(4 * 60 * 60));
+    assert!(four_hours["expires_in_secs"].as_u64().unwrap() >= 4 * 60 * 60 - 1);
+
+    for invalid in [0, 24 * 60 * 60 + 1] {
+        let (status, body) = h.mint_tools_response("lease", Some(invalid)).await;
+        assert_eq!(status, 400, "invalid ttl {invalid} was accepted: {body}");
+        assert!(body["error"].as_str().unwrap().contains("ttl_secs"));
+    }
+    h.shutdown().await;
+}
 
 #[tokio::test]
 #[ignore = "binds sockets and spawns a PTY child"]

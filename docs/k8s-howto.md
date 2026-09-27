@@ -149,10 +149,14 @@ The pod initiates nothing and stores only a hash. Design:
 wire contract: §9 of [`../runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
 
 ```bash
-# Mint a one-hour attach secret for session "laptop" (admin credential required).
+# Mint a four-hour attach secret for session "laptop" (admin credential required).
+# Omit the body for the backwards-compatible one-hour default. The image allows
+# up to 24h (`PTY_TOOLS_ATTACH_TTL` is the operator ceiling).
 curl -s -X POST -H "Authorization: Bearer $CRED" \
+  -H "Content-Type: application/json" -d '{"ttl_secs":14400}' \
   http://<pod-tailnet-ip>:8090/admin/sessions/laptop/tools-attach
-# → {"secret":"…","verifier":"sha256:…","expires_in_secs":3600,"attach":"/tools/attach/laptop"}
+# → {"secret":"…","verifier":"sha256:…","expires_in_secs":14400,
+#    "ttl_secs":14400,"attach":"/tools/attach/laptop"}
 # Hand the secret to the Mac; it dials ws://<pod-tailnet-ip>:8090/tools/attach/laptop
 # with `Authorization: Bearer <secret>`. Revoke any time:
 curl -s -X DELETE -H "Authorization: Bearer $CRED" \

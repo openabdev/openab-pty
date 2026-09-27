@@ -287,6 +287,7 @@ every upgrade with `401`, and the mint endpoint returns `501`.
 
 ```
 POST   /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin-credential>
+       optional JSON: {"ttl_secs": 14400}
 DELETE /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin-credential>
 ```
 
@@ -296,7 +297,8 @@ DELETE /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin
 { "session": "laptop",
   "secret": "b1f0…64 lowercase hex…",
   "verifier": "sha256:…",
-  "expires_in_secs": 3600,
+  "expires_in_secs": 14400,
+  "ttl_secs": 14400,
   "attach": "/tools/attach/laptop" }
 ```
 
@@ -305,8 +307,13 @@ DELETE /admin/sessions/{session}/tools-attach       Authorization: Bearer <admin
 - Minting again **rotates** the secret and resets the TTL. A Mac already attached
   stays attached; a Mac that redials must present the new secret. This is how a
   grant is renewed: mint before expiry, hand over the new secret.
+- Omit the body (or omit `ttl_secs`) for a **one-hour** grant. Connect/Remote
+  request one of 1/2/4/12/24 hours by sending seconds. `tools_attach_ttl` is the
+  operator's ceiling, default **24h** and itself hard-capped at 24h (env
+  `PTY_TOOLS_ATTACH_TTL`); it is not the default lease. `ttl_secs = 0` or a request above that ceiling is `400` with an
+  error naming the maximum — never a successful response with a silent shorter
+  lease. The session's own absolute TTL can still end it first.
 - `404` if the session does not exist; `501` if the plane is off.
-- TTL is `tools_attach_ttl` (default `1h`, env `PTY_TOOLS_ATTACH_TTL`).
 
 `DELETE` → `204` always (once the name parses). It drops the grant and closes any
 attached Mac with **`4010`**. Revoking nothing is not an error.

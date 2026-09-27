@@ -74,7 +74,7 @@ seed_dir = "${PTY_SEED_DIR:-}"
 # Reverse-attached tools (a Mac lends its instance-mcp tools to one session).
 # Empty disables the plane; the runtime refuses anything but loopback here.
 tools_listen = "${PTY_TOOLS_LISTEN:-}"
-tools_attach_ttl = "${PTY_TOOLS_ATTACH_TTL:-1h}"
+tools_attach_ttl = "${PTY_TOOLS_ATTACH_TTL:-24h}"
 EOF
 
 # Fail before serving rather than after: the same validator the runtime applies
