@@ -412,26 +412,43 @@ The runtime sets the env var; it does **not** edit the CLI's config. Whatever ow
 the session's workspace does that. For `kiro-cli` (2.13+), inside the session shell:
 
 ```sh
-kiro-cli mcp add --name mac --url "$OPENAB_TOOLS_MCP_URL" --scope global
+kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
 ```
 
 `mcp add` registers the server but does not trust its tools, so each call prompts.
 To pre-trust them, list them in the agent config's `allowedTools` under the
-`@<server>/<tool>` naming — for the `mac` server, `@mac/screenshot`,
-`@mac/browser_navigate`, … A `~/.kiro/agents/<agent>.json` with both the server and
+`@<server>/<tool>` naming — for the `computer` server,
+`@computer/screenshot`, `@computer/browser_navigate`, … A
+`~/.kiro/agents/<agent>.json` with both the server and
 the allowlist means the agent starts with the Mac's tools already usable:
 
 ```json
 {
   "name": "kiro_default",
-  "mcpServers": { "mac": { "url": "http://127.0.0.1:<port>/mcp/<session>/<key>" } },
-  "allowedTools": ["@mac/screenshot", "@mac/mouse", "@mac/key", "@mac/osascript",
-                   "@mac/browser_navigate", "@mac/browser_snapshot", "@mac/browser_evaluate", "…"]
+  "mcpServers": { "computer": { "url": "http://127.0.0.1:<port>/mcp/<session>/<key>" } },
+  "allowedTools": ["@computer/screenshot", "@computer/mouse", "@computer/key", "@computer/osascript",
+                   "@computer/browser_navigate", "@computer/browser_snapshot", "@computer/browser_evaluate", "…"]
 }
 ```
 
-Alternatively, per invocation: `kiro-cli chat --trust-tools=@mac/screenshot,@mac/browser_navigate,…`.
+Alternatively, per invocation:
+`kiro-cli chat --trust-tools=@computer/screenshot,@computer/browser_navigate,…`.
 Other CLIs use their own MCP config shape; the URL is the same plain loopback URL.
+
+The URL path remains `/mcp/<session>/<key>`. A live URL such as
+`/mcp/mac/606e…` means the **PTY session is named `mac`**; it is not the MCP
+server alias and must not be rewritten to `/mcp/computer/…`. A session named
+`work` gets `/mcp/work/<key>` while the Kiro alias stays `computer`.
+
+Migration from the pre-platform-neutral alias:
+
+```sh
+kiro-cli mcp remove --name mac
+kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
+```
+
+Update `@mac/*` entries in an agent's `allowedTools` to `@computer/*` at the same
+time; keeping both aliases duplicates every served tool.
 
 **Caveat — the key rotates.** The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
 *generation*: a restart-in-place, or tearing down and re-lending a Mac, mints a new
