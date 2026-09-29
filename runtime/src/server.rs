@@ -568,6 +568,12 @@ pub fn tools_router(state: Arc<AppState>) -> Router {
             "/mcp/{session}/{key}",
             post(tools_loopback).get(tools_loopback_no_stream),
         )
+        // Session-independent form: the session is whoever owns the bearer key.
+        // One static MCP config then serves every session in a shared workspace.
+        .route(
+            "/mcp",
+            post(tools_loopback_bearer).get(tools_loopback_no_stream),
+        )
         .layer(DefaultBodyLimit::max(tools::MAX_LOOPBACK_BODY_BYTES))
         .with_state(state)
 }
@@ -1355,7 +1361,55 @@ async fn tools_loopback(
     if state.manager.get(&name).is_none() || !state.tools.check_loopback_key(&name, &key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let request: Value = match serde_json::from_slice(&body) {
+    serve_loopback(&state, &name, &body).await
+}
+
+/// `POST /mcp` with `Authorization: Bearer <session key>` — the same session
+/// key as in `$OPENAB_TOOLS_MCP_URL`, delivered as `$OPENAB_TOOLS_MCP_TOKEN`.
+/// Missing, malformed and unknown keys are all one `401`, so a same-pod caller
+/// learns nothing about which sessions exist.
+async fn tools_loopback_bearer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            [("www-authenticate", "Bearer")],
+            "send Authorization: Bearer $OPENAB_TOOLS_MCP_TOKEN",
+        )
+            .into_response()
+    };
+    let Some(key) = bearer_token(&headers) else {
+        return unauthorized();
+    };
+    let Some(name) = state.tools.session_for_loopback_key(key) else {
+        return unauthorized();
+    };
+    if state.manager.get(&name).is_none() {
+        return unauthorized();
+    }
+    serve_loopback(&state, &name, &body).await
+}
+
+/// `Authorization: Bearer <token>`; the scheme is case-insensitive (RFC 7235).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// One JSON-RPC message for an authenticated session, shared by both routes.
+async fn serve_loopback(state: &Arc<AppState>, name: &SessionName, body: &[u8]) -> Response {
+    let request: Value = match serde_json::from_slice(body) {
         Ok(Value::Object(map)) => Value::Object(map),
         Ok(_) => {
             return (
@@ -1380,7 +1434,7 @@ async fn tools_loopback(
                 .into_response()
         }
     };
-    match state.tools.handle_loopback(&name, request).await {
+    match state.tools.handle_loopback(name, request).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -1474,7 +1528,7 @@ where
                 });
             tracing::info!(
                 tools_listen = %local,
-                "tools plane enabled: loopback POST /mcp/{{session}}/{{key}}; Macs dial in on \
+                "tools plane enabled: loopback POST /mcp/{{session}}/{{key}} or /mcp + Bearer; Macs dial in on \
                  GET /tools/attach/{{session}}"
             );
             let router = tools_router(state.clone());

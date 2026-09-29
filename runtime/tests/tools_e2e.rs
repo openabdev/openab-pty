@@ -12,7 +12,10 @@ use openab_pty::close_code;
 use openab_pty::config;
 use openab_pty::killdomain::{KillDomain, TrackingLimits};
 use openab_pty::server::{self, AppState, ServerConfig};
-use openab_pty::session::{PortablePtySpawner, SessionManager, SessionPolicy, TOOLS_URL_ENV};
+use openab_pty::session::{
+    PortablePtySpawner, SessionManager, SessionPolicy, TOOLS_ENDPOINT_ENV, TOOLS_TOKEN_ENV,
+    TOOLS_URL_ENV,
+};
 use openab_pty::token::TokenStore;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -159,6 +162,11 @@ tools_attach_ttl = "1h"
     /// is what makes the tests below honest: the URL under test is the one the
     /// child process was actually handed, not one the test computed.
     async fn shell_tools_url(&self, name: &str, token: &str) -> String {
+        self.shell_env(name, token, TOOLS_URL_ENV).await
+    }
+
+    /// Ask the session's shell for one environment variable's value.
+    async fn shell_env(&self, name: &str, token: &str, var: &str) -> String {
         let mut socket = ws_connect(
             &format!("ws://{}/pty/{name}", self.addr),
             ("authorization", format!("Bearer {token}")),
@@ -169,9 +177,7 @@ tools_attach_ttl = "1h"
         let _ = next_text(&mut socket).await;
         socket
             .send(tungstenite::Message::Binary(
-                format!("echo TOOLS=${TOOLS_URL_ENV}=END\n")
-                    .into_bytes()
-                    .into(),
+                format!("echo TOOLS=${var}=END\n").into_bytes().into(),
             ))
             .await
             .unwrap();
@@ -187,7 +193,10 @@ tools_attach_ttl = "1h"
                 let text = String::from_utf8_lossy(&collected).to_string();
                 // Skip the echoed command line: take the last match, which is
                 // the expansion.
-                if let Some(start) = text.rfind("TOOLS=http") {
+                if let Some(start) = text
+                    .rfind("TOOLS=")
+                    .filter(|i| !text[*i..].starts_with("TOOLS=$"))
+                {
                     if let Some(end) = text[start..].find("=END") {
                         break text[start + "TOOLS=".len()..start + end].to_string();
                     }
@@ -262,6 +271,22 @@ fn dechunk(body: &str) -> String {
         rest = after.get(size + 2..).unwrap_or("");
     }
     out
+}
+
+/// POST one JSON-RPC message with `Authorization: Bearer <key>` to a full URL.
+async fn mcp_post_bearer(url: &str, key: Option<&str>, message: Value) -> (u16, Value) {
+    let without_scheme = url.strip_prefix("http://").expect("http url");
+    let (host, path) = without_scheme.split_once('/').expect("path");
+    let addr: SocketAddr = host.parse().expect("socket addr in url");
+    let (status, raw) = http_request(
+        addr,
+        "POST",
+        &format!("/{path}"),
+        key,
+        Some(&message.to_string()),
+    )
+    .await;
+    (status, serde_json::from_str(&raw).unwrap_or(Value::Null))
 }
 
 /// POST one JSON-RPC message to a full loopback URL (`http://host:port/path`).
@@ -701,4 +726,84 @@ tools_listen = "0.0.0.0:9000"
         bad.is_err(),
         "config must refuse a non-loopback tools_listen"
     );
+}
+
+/// One static MCP config for a whole workspace: every session posts to the same
+/// `$OPENAB_TOOLS_MCP_ENDPOINT` with its own `$OPENAB_TOOLS_MCP_TOKEN`, and each
+/// reaches its own computer. This is the shape a shared `mcp.json` needs, since
+/// it cannot name a session in its URL. Field finding 2026-09-29: three sessions
+/// sharing a URL-pinned config all answered from one computer.
+#[tokio::test]
+#[ignore = "binds sockets"]
+async fn one_static_endpoint_routes_each_session_by_its_bearer_key() {
+    let h = Harness::start(Duration::from_secs(60)).await;
+    let token_a = h.create("aaa").await;
+    let token_b = h.create("bbb").await;
+
+    let endpoint_a = h.shell_env("aaa", &token_a, TOOLS_ENDPOINT_ENV).await;
+    let endpoint_b = h.shell_env("bbb", &token_b, TOOLS_ENDPOINT_ENV).await;
+    assert_eq!(endpoint_a, format!("http://{}/mcp", h.tools_addr));
+    assert_eq!(
+        endpoint_a, endpoint_b,
+        "the endpoint is the same in every session"
+    );
+
+    let key_a = h.shell_env("aaa", &token_a, TOOLS_TOKEN_ENV).await;
+    let key_b = h.shell_env("bbb", &token_b, TOOLS_TOKEN_ENV).await;
+    assert_eq!(key_a.len(), 64);
+    assert_ne!(key_a, key_b);
+    let url_a = h.shell_tools_url("aaa", &token_a).await;
+    assert!(
+        url_a.ends_with(&format!("/mcp/aaa/{key_a}")),
+        "the token is the URL's key"
+    );
+
+    let secret_a = h.mint_tools("aaa").await;
+    let secret_b = h.mint_tools("bbb").await;
+    let mac_a = fake_mac(h.addr, "aaa", &secret_a, "A").await.unwrap();
+    let mac_b = fake_mac(h.addr, "bbb", &secret_b, "B").await.unwrap();
+
+    let call = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sys_info","arguments":{}}});
+    let mut answers = (String::new(), String::new());
+    for _ in 0..50 {
+        let (sa, ra) = mcp_post_bearer(&endpoint_a, Some(&key_a), call.clone()).await;
+        let (sb, rb) = mcp_post_bearer(&endpoint_a, Some(&key_b), call.clone()).await;
+        assert_eq!((sa, sb), (200, 200));
+        answers = (
+            ra["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            rb["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        if answers.0 == "fake mac A" && answers.1 == "fake mac B" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(answers, ("fake mac A".to_owned(), "fake mac B".to_owned()));
+
+    // Missing, malformed, unknown, wrong-scheme: all the same 401, nothing routed.
+    let probe = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    let (s1, _) = mcp_post_bearer(&endpoint_a, None, probe.clone()).await;
+    let (s2, _) = mcp_post_bearer(&endpoint_a, Some("not-hex"), probe.clone()).await;
+    let (s3, _) = mcp_post_bearer(&endpoint_a, Some(&"0".repeat(64)), probe.clone()).await;
+    let (s4, _) = mcp_post_bearer(&endpoint_a, Some(&key_a[..32]), probe.clone()).await;
+    assert_eq!((s1, s2, s3, s4), (401, 401, 401, 401));
+
+    // The key dies with the session: after deleting A, its token routes nowhere.
+    h.admin("DELETE", "/admin/sessions/aaa", None).await;
+    let (s5, _) = mcp_post_bearer(&endpoint_a, Some(&key_a), probe.clone()).await;
+    assert_eq!(s5, 401);
+    let (s6, _) = mcp_post_bearer(&endpoint_a, Some(&key_b), probe).await;
+    assert_eq!(s6, 200, "B is unaffected");
+
+    h.admin("DELETE", "/admin/sessions/bbb/tools-attach", None)
+        .await;
+    let _ = mac_a.await;
+    let _ = mac_b.await;
+    h.shutdown().await;
 }

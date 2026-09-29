@@ -376,10 +376,23 @@ Every session child is spawned with
 
 ```
 OPENAB_TOOLS_MCP_URL=http://127.0.0.1:<tools port>/mcp/<session>/<64-hex key>
+OPENAB_TOOLS_MCP_ENDPOINT=http://127.0.0.1:<tools port>/mcp
+OPENAB_TOOLS_MCP_TOKEN=<the same 64-hex key>
 ```
 
-Point the CLI's MCP config at it as a Streamable HTTP server. The runtime does not
-edit any CLI's config; whatever installs the CLI does that. Properties:
+Two equivalent ways in, to the same session's tools:
+
+- `POST $OPENAB_TOOLS_MCP_URL` — the session is in the path.
+- `POST $OPENAB_TOOLS_MCP_ENDPOINT` with `Authorization: Bearer $OPENAB_TOOLS_MCP_TOKEN` —
+  the endpoint is **identical in every session**; the key selects the session.
+  Missing, malformed or unknown key → `401` (`WWW-Authenticate: Bearer`),
+  indistinguishable. Use this form whenever the CLI's MCP config is a file shared
+  by several sessions (a workspace `.kiro/settings/mcp.json`, a repo `.mcp.json`):
+  such a file cannot name one session in its URL, and a URL pinned to one session
+  silently routes every session to that session's computer.
+
+Point the CLI's MCP config at one of them as a Streamable HTTP server. The runtime
+does not edit any CLI's config; whatever installs the CLI does that. Properties:
 
 - `POST` one JSON-RPC object → one JSON response, `200`. A notification → `202`,
   empty body. `GET` → `405`: there is no server-to-client stream, and saying so
@@ -408,8 +421,29 @@ edit any CLI's config; whatever installs the CLI does that. Properties:
 
 #### Wiring the URL into the coding CLI
 
-The runtime sets the env var; it does **not** edit the CLI's config. Whatever owns
-the session's workspace does that. For `kiro-cli` (2.13+), inside the session shell:
+The runtime sets the env vars; it does **not** edit the CLI's config. Whatever owns
+the session's workspace does that.
+
+**Preferred — one config for every session.** The file never changes, across
+sessions, restarts or re-lends, as long as the CLI expands environment variables in
+HTTP headers. `kiro-cli` does (`${VAR}` in `headers`; it does **not** expand `url`):
+
+```json
+{
+  "mcpServers": {
+    "computer": {
+      "url": "http://127.0.0.1:<tools port>/mcp",
+      "headers": { "Authorization": "Bearer ${OPENAB_TOOLS_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+The port is fixed by `PTY_TOOLS_LISTEN`, so the URL is a constant. Each CLI process
+expands `${OPENAB_TOOLS_MCP_TOKEN}` from its own session's environment.
+
+**Per session — only when the config is private to one session.** For `kiro-cli`
+(2.13+), inside the session shell:
 
 ```sh
 kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
@@ -450,7 +484,7 @@ kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
 Update `@mac/*` entries in an agent's `allowedTools` to `@computer/*` at the same
 time; keeping both aliases duplicates every served tool.
 
-**Caveat — the key rotates.** The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
+**Caveat — the key rotates** (this is what the header form above avoids). The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
 *generation*: a restart-in-place, or tearing down and re-lending a Mac, mints a new
 URL, and any config that hard-codes the old one (both `mcp.json` and the agent's
 `allowedTools` server entry) must be updated. Re-run `mcp add`, or read

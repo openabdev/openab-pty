@@ -1004,6 +1004,15 @@ pub struct ToolsEndpoint {
 /// Environment variable that carries the session's tools MCP URL to the CLI.
 pub const TOOLS_URL_ENV: &str = "OPENAB_TOOLS_MCP_URL";
 
+/// The same session key on its own, for `Authorization: Bearer` at the
+/// session-independent endpoint below. A workspace MCP config is shared by
+/// every session in the pod, so it cannot name a session in its URL; it can
+/// reference this variable in a header, which each CLI expands per process.
+pub const TOOLS_TOKEN_ENV: &str = "OPENAB_TOOLS_MCP_TOKEN";
+
+/// `http://127.0.0.1:<port>/mcp` — identical in every session.
+pub const TOOLS_ENDPOINT_ENV: &str = "OPENAB_TOOLS_MCP_ENDPOINT";
+
 impl SessionManager {
     pub fn new(
         config: PtyConfig,
@@ -1193,10 +1202,17 @@ impl SessionManager {
         // restart-in-place rotates it with the shell.
         if let Some(endpoint) = self.tools.lock().as_ref() {
             let key = endpoint.hub.issue_loopback_key(&name);
-            env.retain(|(k, _)| k != TOOLS_URL_ENV);
+            env.retain(|(k, _)| {
+                k != TOOLS_URL_ENV && k != TOOLS_TOKEN_ENV && k != TOOLS_ENDPOINT_ENV
+            });
             env.push((
                 TOOLS_URL_ENV.to_string(),
                 format!("{}/mcp/{}/{}", endpoint.base_url, name.as_str(), key),
+            ));
+            env.push((TOOLS_TOKEN_ENV.to_string(), key));
+            env.push((
+                TOOLS_ENDPOINT_ENV.to_string(),
+                format!("{}/mcp", endpoint.base_url),
             ));
         }
         let request = SpawnRequest {

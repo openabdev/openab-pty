@@ -438,6 +438,25 @@ impl ToolsHub {
         bytes.len() == expected.len() && bool::from(bytes.as_slice().ct_eq(&expected))
     }
 
+    /// The session whose current loopback key is `presented`, for the
+    /// session-independent `POST /mcp` + `Authorization: Bearer` route. Every
+    /// key is compared in constant time and the scan never exits early, so the
+    /// answer's timing does not depend on which session (if any) matched.
+    pub fn session_for_loopback_key(&self, presented: &str) -> Option<SessionName> {
+        let bytes = hex::decode(presented).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let keys = self.loopback_keys.lock();
+        let mut found: Option<SessionName> = None;
+        for (session, expected) in keys.iter() {
+            if bool::from(bytes.as_slice().ct_eq(expected)) {
+                found = Some(session.clone());
+            }
+        }
+        found
+    }
+
     pub fn forget_session(&self, session: &SessionName) {
         self.loopback_keys.lock().remove(session);
         self.revoke(session, close_code::SESSION_ENDED);
