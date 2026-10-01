@@ -263,7 +263,7 @@ mod tests {
     }
 
     fn base_env() -> Vec<(String, String)> {
-        hook_env(std::env::vars(), None)
+        hook_env(crate::session::utf8_env(), None)
     }
 
     #[test]

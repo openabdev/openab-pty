@@ -294,12 +294,9 @@ async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()>
             .as_ref()
             .and_then(|listener| listener.local_addr().ok())
             .map(|addr| addr.to_string());
-        // vars_os, not vars: a non-UTF-8 variable anywhere in the container's
-        // environment must not panic the runtime at boot. Such a variable is
-        // dropped (the allowlist names only ASCII keys anyway).
-        let source = std::env::vars_os()
-            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
-        let env = openab_pty::hook::hook_env(source, tools_bound.as_deref());
+        // Not std::env::vars(): a non-UTF-8 variable must not panic the boot.
+        let env =
+            openab_pty::hook::hook_env(openab_pty::session::utf8_env(), tools_bound.as_deref());
         // Best-effort end to end: even the blocking task itself failing (a
         // panic inside it) is a warning, never a reason to refuse to serve.
         if let Err(error) = tokio::task::spawn_blocking(move || {

@@ -219,6 +219,27 @@ impl WindowSize {
     }
 }
 
+/// The process environment as UTF-8 pairs, for building a child's environment.
+///
+/// `std::env::vars()` panics on the first non-UTF-8 key or value, and the
+/// runtime does not choose what its container is started with: one such
+/// variable anywhere would panic every session spawn (and, with a startup
+/// hook, the boot). A pair that is not UTF-8 in key or value is dropped
+/// instead. Nothing is lost by it: every allowlisted name is ASCII, and a
+/// forward's value is handed to a shell as a string anyway.
+pub fn utf8_env() -> impl Iterator<Item = (String, String)> {
+    utf8_pairs(std::env::vars_os())
+}
+
+fn utf8_pairs<I>(source: I) -> impl Iterator<Item = (String, String)>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    source
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+}
+
 /// Build the child's environment from an allowlist.
 pub fn child_env<I>(source: I, home: &str, size_term: Option<&str>) -> Vec<(String, String)>
 where
@@ -1193,7 +1214,7 @@ impl SessionManager {
     ) -> Result<SessionCredential, Error> {
         let mut containment = self.kill.open_session(&name, generation)?;
         let mut env = child_env(
-            std::env::vars(),
+            utf8_env(),
             &self.workspace().to_string_lossy(),
             Some(DEFAULT_TERM),
         );
@@ -2176,6 +2197,30 @@ mod tests {
     }
 
     // ---- environment ----------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn utf8_pairs_drops_non_utf8_instead_of_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad = || OsString::from_vec(vec![0xff, 0xfe]);
+        let source = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (bad(), OsString::from("x")),
+            (OsString::from("LANG"), bad()),
+            (OsString::from("HOME"), OsString::from("/workspace")),
+        ];
+        let pairs: Vec<(String, String)> = utf8_pairs(source).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("HOME".to_string(), "/workspace".to_string()),
+            ]
+        );
+        // And the real process environment is readable without a panic.
+        assert!(utf8_env().any(|(key, _)| key == "PATH"));
+    }
 
     #[test]
     fn child_env_is_an_allowlist_and_drops_every_credential_shaped_variable() {
