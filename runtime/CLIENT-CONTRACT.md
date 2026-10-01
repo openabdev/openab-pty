@@ -159,9 +159,9 @@ Two behaviours of that proxy are worth knowing. The kitty query (`CSI ? u`) is
 answered with the flag state the client actually applied: the runtime watches
 `CSI >` / `CSI <` / `CSI = … u` (push/pop/set) go by on their way to you and keeps
 the same per-screen stack your emulator does, so an app that pushes flags and then
-queries is told its push succeeded. The mirror **assumes** what Connect does: a
-fresh emulator on an attach without `?since=`, and an emulator reset (RIS /
-`resetToInitialState`) as the way you clear-and-redraw on a `gap`. In those two
+queries is told its push succeeded. The mirror **assumes** a fresh emulator on
+an attach without `?since=`, and an emulator reset (RIS / `resetToInitialState`,
+what Connect does) as the way you clear-and-redraw on a `gap`. In those two
 cases the runtime resets its mirror and re-reads the replay you are about to be
 sent; a contiguous resume (including `?since=0` with nothing evicted) keeps it.
 If your client clears a gap without resetting its emulator, or after a

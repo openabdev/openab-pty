@@ -26,7 +26,8 @@
 //!
 //! The client's emulator is not only moved by these bytes, though. The
 //! runtime *assumes* a client that starts a fresh emulator on an attach with no
-//! cursor, and resets it (RIS) on a `gap` frame — what Connect does. The
+//! cursor, and resets it (RIS) on a `gap` frame — the latter is what Connect
+//! does; neither shipped client attaches without a cursor today. The
 //! session therefore calls [`CapabilityProxy::resync`] at attach in exactly
 //! those two cases — reset, then re-observe the replay bytes the client is
 //! about to be fed — so the two models start from the same place. (An attach
