@@ -443,8 +443,8 @@ fn every_answer_shape_the_proxy_emits_is_filtered_on_the_way_back() {
 
 // ---------------------------------------------------------------------------
 // Unproxied reply passthrough (#53) — queries the proxy leaves to the client
-// (OSC 4 palette, XTVERSION DCS >|, and CPR) must not have their client replies
-// eaten by TermFilter on the way back to the child.
+// (OSC 4 palette, XTVERSION, tertiary DA, DECRQSS, XTGETTCAP, and CPR) must
+// not have their client replies eaten by TermFilter on the way back to the child.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -458,6 +458,9 @@ fn client_replies_to_unproxied_queries_reach_child() {
         b"\x1b]4;255;rgb:ffff/ffff/ffff\x1b\\", // OSC 4 palette reply (ST)
         b"\x1bP>|SwiftTerm 1.19\x1b\\",         // XTVERSION
         b"\x1bP>|xterm.js(5.3.0)\x1b\\",
+        b"\x1bP!|7E565445\x1b\\",         // tertiary DA
+        b"\x1bP1$r0;1m\x1b\\",            // DECRQSS
+        b"\x1bP1+r544e=787465726d\x1b\\", // XTGETTCAP
     ] {
         assert_eq!(
             filter.filter(reply).as_ref(),
