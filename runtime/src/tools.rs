@@ -54,8 +54,6 @@ use crate::{Error, SessionName};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use rand::rngs::OsRng;
-use rand::TryRngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -418,7 +416,7 @@ impl ToolsHub {
         let mut raw = [0u8; 32];
         // A failure here is not worth refusing the spawn over; a zero key simply
         // never matches, so the session has no tools until a restart.
-        if OsRng.try_fill_bytes(&mut raw).is_err() {
+        if getrandom::fill(&mut raw).is_err() {
             tracing::warn!(%session, "OS RNG failed while issuing a tools loopback key");
             self.loopback_keys.lock().remove(session);
             return String::new();
@@ -863,7 +861,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// 256 random bits as 64 lowercase hex bytes — header-safe, as attach tokens are.
 fn random_hex() -> Result<Vec<u8>, Error> {
     let mut raw = [0u8; 32];
-    OsRng.try_fill_bytes(&mut raw).map_err(|e| {
+    getrandom::fill(&mut raw).map_err(|e| {
         Error::Other(format!(
             "OS RNG failed while minting a tools attach secret: {e}"
         ))
