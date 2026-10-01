@@ -41,9 +41,10 @@ jobs:
         # agentcore (excluded by decision). The base decides which agent CLI a
         # session lands next to; one openab-pty image per variant keeps that
         # adjacency: deploy openab-pty:pre-beta-claude and the terminal opens
-        # beside claude, and so on.
+        # beside claude, and so on. Hermes is gone: openab removed it
+        # (openabdev/openab#1523) and nightly dropped it in #28.
         variant: [antigravity, claude, codex, copilot, cursor, devin, gemini,
-                  grok, hermes, kiro, mimocode, native, opencode, pi]
+                  grok, kiro, mimocode, native, opencode, pi]
     permissions:
       contents: read
       # Publishing to GHCR under the openabdev org needs this. It replaces the
