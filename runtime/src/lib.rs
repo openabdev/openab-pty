@@ -27,6 +27,7 @@ pub mod audit;
 pub mod capproxy;
 pub mod config;
 pub mod containment;
+pub mod hook;
 pub mod killdomain;
 pub mod ringbuf;
 pub mod seed;

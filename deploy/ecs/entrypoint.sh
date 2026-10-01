@@ -81,4 +81,12 @@ EOF
 # at startup, so a bad projection is a clear message instead of a crash loop.
 /usr/local/bin/openab-pty --validate-projection "$CONFIG"
 
+# The image's startup hook wires its own CLI's config (today: the tools MCP into
+# kiro-cli, #39). The runtime runs it after seeding, so a seeded config is what
+# it edits rather than what overwrites it. Optional: an image without it, such
+# as the local-build deploy/ecs/Dockerfile, just runs without a hook.
+HOOK=/usr/local/libexec/openab-pty/startup-hook
+if [[ -x $HOOK ]]; then
+    exec /usr/local/bin/openab-pty --config "$CONFIG" --startup-hook "$HOOK" "$@"
+fi
 exec /usr/local/bin/openab-pty --config "$CONFIG" "$@"

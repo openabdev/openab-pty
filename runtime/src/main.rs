@@ -16,7 +16,9 @@
 //!    promise. An operator who required Tier 2 is refused here: it is not
 //!    implemented, and best effort must never be served under a guarantee's name.
 //! 4. Seeded state, applied into $HOME before anything can observe the workspace.
-//! 5. Bind, behind the fail-closed listener guard.
+//! 5. The image's startup hook, if any (`--startup-hook`), after seeding so it
+//!    layers on top of whatever the seed delivered. Best-effort: never fatal.
+//! 6. Bind, behind the fail-closed listener guard.
 //!
 //! Graceful shutdown runs the same order in reverse: notice → grace →
 //! `close_code::RUNTIME_REPLACED` → session teardown.
@@ -62,6 +64,13 @@ struct Cli {
     /// stored by the runtime; only the `sha256:` verifier belongs in a projection.
     #[arg(long)]
     generate_admin_credential: bool,
+
+    /// An executable the image provides, run once after seeding and before
+    /// serving — where an image wires its own CLI's config (e.g. the tools
+    /// MCP). Set by the image's entrypoint, not an operator knob. Best-effort:
+    /// a failure or timeout is logged and serving continues.
+    #[arg(long, value_name = "FILE")]
+    startup_hook: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -118,7 +127,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the Tokio runtime")?;
-    runtime.block_on(run(projection))
+    runtime.block_on(run(projection, cli.startup_hook))
 }
 
 fn print_generated_admin_credential() -> Result<()> {
@@ -174,7 +183,7 @@ fn validate_only(path: &PathBuf) -> Result<()> {
     }
 }
 
-async fn run(projection: PtyConfig) -> Result<()> {
+async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()> {
     let audit = AuditLogger;
 
     // (3) Kill domain. Reaping first (best effort, never fail-closed), then the
@@ -212,6 +221,13 @@ async fn run(projection: PtyConfig) -> Result<()> {
         if applied.archives.is_empty() {
             tracing::info!("seed: nothing to apply");
         }
+    }
+
+    // After the seed, so a seeded config file is what the hook edits rather than
+    // what overwrites the hook's edit; before any session exists, so no session
+    // ever sees a half-written config. See `openab_pty::hook`.
+    if let Some(hook) = startup_hook.as_deref() {
+        openab_pty::hook::run_startup_hook(hook, openab_pty::hook::STARTUP_HOOK_TIMEOUT);
     }
 
     let tokens = TokenStore::new(projection.attach_token_ttl, audit.clone());

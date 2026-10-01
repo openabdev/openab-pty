@@ -87,6 +87,14 @@ COPY --from=builder --chown=root:root --chmod=755 \
 # fails at `crun: open executable: Permission denied` on every single container,
 # including as root, which is a confusing way to learn a file has no x bit.
 COPY --chown=root:root --chmod=755 deploy/ecs/entrypoint.sh /usr/local/bin/openab-pty-entrypoint
+# The startup hook (see runtime/src/hook.rs) merges the tools MCP into the CLI's
+# JSON config, and jq is how it does that without the runtime learning any CLI's
+# format. The base has no jq, python or (for kiro) node.
+COPY --chown=root:root --chmod=755 deploy/hooks/startup-hook.sh /usr/local/libexec/openab-pty/startup-hook
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
 
 USER 1000
 # The listener default is loopback, and the runtime refuses an off-loopback bind

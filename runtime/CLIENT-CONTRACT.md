@@ -421,8 +421,36 @@ does not edit any CLI's config; whatever installs the CLI does that. Properties:
 
 #### Wiring the URL into the coding CLI
 
-The runtime sets the env vars; it does **not** edit the CLI's config. Whatever owns
-the session's workspace does that.
+The runtime sets the env vars; it does **not** edit the CLI's config, and knows no
+CLI's config format. The **image** does that: each variant is built for one CLI,
+and ships a startup hook (`deploy/hooks/startup-hook.sh`, installed at
+`/usr/local/libexec/openab-pty/startup-hook`) that the runtime runs once, after
+seeding and before serving. The hook writes the session-independent form below,
+so the CLI starts with the `computer` server present and needs no `mcp add`.
+
+**What the hook writes today (kiro-cli).** When `PTY_TOOLS_LISTEN` is set and
+`kiro-cli` is on `PATH`:
+
+- `~/.kiro/settings/mcp.json` gets exactly `mcpServers.computer` = the block
+  below. Every other server and setting, and the file's key order and mode, are
+  kept; a stale hand-written `computer` entry (a per-session URL) is replaced.
+- every existing `~/.kiro/agents/*.json` gets `@computer/*` in `allowedTools`.
+  Agent files are never created, and a restrictive `tools` list is left as the
+  user wrote it — trust is added, visibility is not.
+- a file that is not a JSON object, or whose `mcpServers` / `allowedTools` has
+  the wrong type, is left byte-identical; a dangling symlink is left alone.
+- with `PTY_TOOLS_LISTEN` unset, only an entry the hook wrote (recognised by its
+  header) is removed again; a user's own `computer` entry is kept.
+
+The hook is best-effort: any failure is logged and the runtime serves anyway.
+Other CLIs are not wired yet — the env vars and the manual steps below apply, and
+adding one is a function in the hook, not a runtime change.
+
+The server is configured before any session exists, but what it *serves* depends
+on whether a Mac is lent: with none attached, `tools/list` answers only
+`instance_status`. kiro lists tools when a chat starts and this endpoint pushes
+no `tools/list_changed` over plain `POST`, so a chat opened before the Mac was
+lent needs a restart (or a fresh `tools/list`) to see the Mac's tools.
 
 **Preferred — one config for every session.** The file never changes, across
 sessions, restarts or re-lends, as long as the CLI expands environment variables in
@@ -488,8 +516,8 @@ time; keeping both aliases duplicates every served tool.
 *generation*: a restart-in-place, or tearing down and re-lending a Mac, mints a new
 URL, and any config that hard-codes the old one (both `mcp.json` and the agent's
 `allowedTools` server entry) must be updated. Re-run `mcp add`, or read
-`$OPENAB_TOOLS_MCP_URL` again, after each re-lend. Injecting and refreshing this
-automatically at session spawn is [tracked as #39](https://github.com/openabdev/openab-pty/issues/39); until then it is a documented manual step.
+`$OPENAB_TOOLS_MCP_URL` again, after each re-lend. The hook-written form above
+never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 
 ### 9.4 Minimum viable lender
 
@@ -500,4 +528,6 @@ automatically at session spawn is [tracked as #39](https://github.com/openabdev/
    other 4xxx stop.
 5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
 
-The CLI side is zero steps: the URL is already in its environment.
+The CLI side is zero steps: on a variant the image's startup hook knows (today
+`kiro-cli`) the `computer` server is already configured and trusted; on any
+other, the URL is already in its environment.

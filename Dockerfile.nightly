@@ -183,6 +183,11 @@ COPY --from=builder --chown=root:root --chmod=755 \
 # source mode; without it every container fails at "open executable: Permission
 # denied" (see the identical comment in Dockerfile).
 COPY --chown=root:root --chmod=755 deploy/ecs/entrypoint.sh /usr/local/bin/openab-pty-entrypoint
+# Same startup hook and jq as Dockerfile; still root here from the CLI upgrade.
+COPY --chown=root:root --chmod=755 deploy/hooks/startup-hook.sh /usr/local/libexec/openab-pty/startup-hook
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
 
 USER 1000
 # Same defaults as Dockerfile, on purpose — the nightly channel changes the CLI

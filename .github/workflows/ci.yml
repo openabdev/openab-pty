@@ -49,3 +49,14 @@ jobs:
       # shutdown drain.
       - run: cargo test --locked -- --ignored --test-threads=1
       - run: cargo fmt --check
+
+  # The image's startup hook (deploy/hooks/startup-hook.sh) is shell + jq and
+  # runs only in the Linux image, so it is tested on Linux with GNU coreutils
+  # and jq, which is what the image has. Runs as the unprivileged runner user,
+  # which the unwritable-directory case depends on.
+  startup-hook:
+    name: startup hook
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash deploy/hooks/test-startup-hook.sh

@@ -144,6 +144,10 @@ tailscale status | grep openab-pty     # find the address
 With `PTY_TOOLS_LISTEN` set (the manifest sets `127.0.0.1:8091`), a Mac running
 `oab-instance-mcp` can **dial in** and lend its tools to one session; the coding
 CLI inside that session then finds them at the URL in `$OPENAB_TOOLS_MCP_URL`.
+On the `kiro` image the startup hook has already written the `computer` server
+into `~/.kiro/settings/mcp.json` (and `@computer/*` trust into existing agent
+files), so there is no `mcp add` step; the hook's log lines appear in the
+runtime's container log at startup.
 The pod initiates nothing and stores only a hash. Design:
 [reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md);
 wire contract: §9 of [`../runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
