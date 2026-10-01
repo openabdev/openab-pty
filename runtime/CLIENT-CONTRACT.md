@@ -425,22 +425,33 @@ The runtime sets the env vars; it does **not** edit the CLI's config, and knows 
 CLI's config format. The **image** does that: each variant is built for one CLI,
 and ships a startup hook (`deploy/hooks/startup-hook.sh`, installed at
 `/usr/local/libexec/openab-pty/startup-hook`) that the runtime runs once, after
-seeding and before serving. The hook writes the session-independent form below,
-so the CLI starts with the `computer` server present and needs no `mcp add`.
+seeding and binding and before serving. The hook writes the session-independent
+form below, so the CLI starts with the `computer` server present and needs no
+`mcp add`. The runtime hands the hook the session environment allowlist (never
+its own environment) plus `OPENAB_PTY_TOOLS_LISTEN`, the tools address it
+actually bound — the same one sessions see in `OPENAB_TOOLS_MCP_ENDPOINT`.
 
-**What the hook writes today (kiro-cli).** When `PTY_TOOLS_LISTEN` is set and
+**What the hook writes today (kiro-cli).** When the tools plane is on and
 `kiro-cli` is on `PATH`:
 
-- `~/.kiro/settings/mcp.json` gets exactly `mcpServers.computer` = the block
-  below. Every other server and setting, and the file's key order and mode, are
-  kept; a stale hand-written `computer` entry (a per-session URL) is replaced.
-- every existing `~/.kiro/agents/*.json` gets `@computer/*` in `allowedTools`.
-  Agent files are never created, and a restrictive `tools` list is left as the
-  user wrote it — trust is added, visibility is not.
-- a file that is not a JSON object, or whose `mcpServers` / `allowedTools` has
-  the wrong type, is left byte-identical; a dangling symlink is left alone.
-- with `PTY_TOOLS_LISTEN` unset, only an entry the hook wrote (recognised by its
-  header) is removed again; a user's own `computer` entry is kept.
+- `~/.kiro/settings/mcp.json` gets `mcpServers.computer` = the block below.
+  Every other server and setting, and the file's key order and mode, are kept.
+  An existing `computer` entry is replaced only if the hook wrote it, or if it
+  is a hand-wired URL on this same listener (the rotation-broken
+  `/mcp/<session>/<key>` form); any other `computer` entry is the user's and is
+  left alone, with a warning.
+- every existing `~/.kiro/agents/*.json` gets `@computer/*` in `allowedTools`
+  (unless it already has `@computer/*`, `@computer` or `*`). Agent files are
+  never created, and a restrictive `tools` list or an agent's own `mcpServers`
+  is left as the user wrote it — trust is added, visibility is not. An agent
+  with `includeMcpJson: false` therefore does not see the server until its
+  owner adds it.
+- a file that is not exactly one JSON object, or whose `mcpServers` /
+  `allowedTools` has the wrong type, is left byte-identical; a dangling symlink,
+  or a path that is not a regular file, is left alone.
+- with the tools plane off, only the server entry the hook wrote (recognised by
+  its header) is removed again. `@computer/*` trust in agent files stays: it
+  grants nothing while no `computer` server is configured.
 
 The hook is best-effort: any failure is logged and the runtime serves anyway.
 Other CLIs are not wired yet — the env vars and the manual steps below apply, and

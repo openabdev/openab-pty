@@ -16,9 +16,14 @@
 //!    promise. An operator who required Tier 2 is refused here: it is not
 //!    implemented, and best effort must never be served under a guarantee's name.
 //! 4. Seeded state, applied into $HOME before anything can observe the workspace.
-//! 5. The image's startup hook, if any (`--startup-hook`), after seeding so it
-//!    layers on top of whatever the seed delivered. Best-effort: never fatal.
-//! 6. Bind, behind the fail-closed listener guard.
+//!    Then bind, behind the fail-closed listener guard (accepting nothing yet).
+//! 5. The image's startup hook, if any (`--startup-hook`): after seeding so it
+//!    layers on top of whatever the seed delivered, after binding so it is handed
+//!    the bound tools address. Best-effort, never fatal. The hook execs, so it is
+//!    an ordinary dumpable process for up to its timeout; that is safe only
+//!    because it is handed the session env allowlist, not this process's
+//!    environment, and because no session exists yet to read it.
+//! 6. Serve.
 //!
 //! Graceful shutdown runs the same order in reverse: notice → grace →
 //! `close_code::RUNTIME_REPLACED` → session teardown.
@@ -199,7 +204,7 @@ async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()>
     let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
 
     let spawner = Arc::new(PortablePtySpawner);
-    // Seed before any session machinery exists, not merely before binding. /workspace is one trust zone shared by every
+    // (4) Seed before any session machinery exists, not merely before binding. /workspace is one trust zone shared by every
     // session, so a session must never be able to observe a half-applied archive --
     // and an agent whose steering files arrived late is an agent that behaved like a
     // different one for its first few seconds.
@@ -221,13 +226,6 @@ async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()>
         if applied.archives.is_empty() {
             tracing::info!("seed: nothing to apply");
         }
-    }
-
-    // After the seed, so a seeded config file is what the hook edits rather than
-    // what overwrites the hook's edit; before any session exists, so no session
-    // ever sees a half-written config. See `openab_pty::hook`.
-    if let Some(hook) = startup_hook.as_deref() {
-        openab_pty::hook::run_startup_hook(hook, openab_pty::hook::STARTUP_HOOK_TIMEOUT);
     }
 
     let tokens = TokenStore::new(projection.attach_token_ttl, audit.clone());
@@ -285,6 +283,26 @@ async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()>
         )
     };
 
+    // (5) The image's startup hook. After the seed, so a seeded config file is
+    // what the hook edits rather than what overwrites the hook's edit; after the
+    // binds, so it is handed the tools address actually bound (the one sessions
+    // get) rather than re-deriving it; before serving, so no session exists and
+    // none can see a half-written config. It gets the session env allowlist,
+    // never this process's environment. See `openab_pty::hook`.
+    if let Some(hook) = startup_hook {
+        let tools_bound = tools_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.to_string());
+        let env = openab_pty::hook::hook_env(std::env::vars(), tools_bound.as_deref());
+        tokio::task::spawn_blocking(move || {
+            openab_pty::hook::run_startup_hook(&hook, &env, openab_pty::hook::STARTUP_HOOK_TIMEOUT)
+        })
+        .await
+        .context("startup hook task")?;
+    }
+
+    // (6) Serve.
     let state = AppState::new(manager, verifier, admin, audit, server_config);
     server::serve_with_tools(state, listener, tools_listener, shutdown_signal())
         .await

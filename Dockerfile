@@ -89,7 +89,9 @@ COPY --from=builder --chown=root:root --chmod=755 \
 COPY --chown=root:root --chmod=755 deploy/ecs/entrypoint.sh /usr/local/bin/openab-pty-entrypoint
 # The startup hook (see runtime/src/hook.rs) merges the tools MCP into the CLI's
 # JSON config, and jq is how it does that without the runtime learning any CLI's
-# format. The base has no jq, python or (for kiro) node.
+# format. The base has no jq, python or (for kiro) node. jq comes from the
+# base's Debian release (trixie: 1.7.1); not version-pinned, because Debian
+# point releases drop superseded versions and a pin would break the build.
 COPY --chown=root:root --chmod=755 deploy/hooks/startup-hook.sh /usr/local/libexec/openab-pty/startup-hook
 USER root
 RUN apt-get update \

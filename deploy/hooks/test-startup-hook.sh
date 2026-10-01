@@ -25,7 +25,15 @@ fresh_home() {
         chmod 755 "$BIN/kiro-cli"
     fi
 }
-run_hook() { HOME=$HOME PATH="$BIN:$PATH" PTY_TOOLS_LISTEN=${LISTEN-127.0.0.1:8091} bash "$HOOK" >/dev/null 2>&1; }
+# The runtime clears the environment (runtime/src/hook.rs), so the test does too.
+run_hook() {
+    local listen=${LISTEN-127.0.0.1:8091}
+    if [[ -n $listen ]]; then
+        env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" OPENAB_PTY_TOOLS_LISTEN="$listen" bash "$HOOK" >/dev/null 2>&1
+    else
+        env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" bash "$HOOK" >/dev/null 2>&1
+    fi
+}
 mcp() { echo "$HOME/.kiro/settings/mcp.json"; }
 sum() { sha256sum "$1" | cut -d' ' -f1; }
 
@@ -135,12 +143,74 @@ fresh_home kiro
 mkdir -p "$HOME/.kiro/settings"
 echo '{}' >"$(mcp)"
 chmod 555 "$HOME/.kiro/settings"
-if HOME=$HOME PATH="$BIN:$PATH" PTY_TOOLS_LISTEN=$LISTEN bash "$HOOK" >/dev/null 2>&1; then
+if run_hook; then
     ok "unwritable dir: exit 0"
 else
     not_ok "unwritable dir: exit 0"
 fi
 chmod 755 "$HOME/.kiro/settings"
+
+# --- review round 1 ---------------------------------------------------------------
+# A planted ~/.jq must not change what the hook does (HOME is the shared workspace).
+fresh_home kiro
+printf 'def has(k): error("pwned");\n' >"$HOME/.jq"
+run_hook
+check "planted .jq: ignored, entry still written" '[[ $(jq -r .mcpServers.computer.url "$(mcp)") == "http://127.0.0.1:8091/mcp" ]]'
+
+# Tools on: a user's own `computer` server is left alone.
+fresh_home kiro
+mkdir -p "$HOME/.kiro/settings"
+echo '{"mcpServers":{"computer":{"command":"mine","disabled":false}}}' >"$(mcp)"
+before=$(sum "$(mcp)")
+run_hook
+check "on: a user's own computer entry is kept" '[[ $(sum "$(mcp)") == "$before" ]]'
+
+# ...and so is one on a different listener.
+fresh_home kiro
+mkdir -p "$HOME/.kiro/settings"
+echo '{"mcpServers":{"computer":{"url":"http://127.0.0.1:9999/mcp/x/y"}}}' >"$(mcp)"
+before=$(sum "$(mcp)")
+run_hook
+check "on: a computer url on another listener is kept" '[[ $(sum "$(mcp)") == "$before" ]]'
+
+# Our own entry from an earlier boot on a different port is refreshed.
+fresh_home kiro
+LISTEN=127.0.0.1:7000 run_hook
+run_hook
+check "on: our entry follows a changed port" '[[ $(jq -r .mcpServers.computer.url "$(mcp)") == "http://127.0.0.1:8091/mcp" ]]'
+
+fresh_home kiro
+LISTEN='[::1]:8091' run_hook
+check "ipv6 listener: bracketed url" '[[ $(jq -r .mcpServers.computer.url "$(mcp)") == "http://[::1]:8091/mcp" ]]'
+
+fresh_home kiro
+mkdir -p "$(mcp)"
+run_hook
+check "mcp.json is a directory: left alone, no stray temp" '[[ -d $(mcp) && -z $(ls -A "$(mcp)") ]]'
+
+fresh_home kiro
+mkdir -p "$HOME/.kiro/settings"
+printf '{} {}' >"$(mcp)"
+before=$(sum "$(mcp)")
+run_hook
+check "multi-document file: left byte-identical" '[[ $(sum "$(mcp)") == "$before" ]]'
+
+fresh_home kiro
+mkdir -p "$HOME/.kiro/agents" "$HOME/dotfiles"
+echo '{"name":"s"}' >"$HOME/dotfiles/s.json"
+ln -s "$HOME/dotfiles/s.json" "$HOME/.kiro/agents/s.json"
+echo '{"name":"star","allowedTools":["*"]}' >"$HOME/.kiro/agents/star.json"
+star_before=$(sum "$HOME/.kiro/agents/star.json")
+run_hook
+check "agent symlink: link kept, target trusted" '[[ -L $HOME/.kiro/agents/s.json && $(jq -c .allowedTools "$HOME/dotfiles/s.json") == "[\"@computer/*\"]" ]]'
+check "agent with allowedTools [*]: unchanged" '[[ $(sum "$HOME/.kiro/agents/star.json") == "$star_before" ]]'
+
+fresh_home kiro
+if env -i PATH="$BIN:/usr/bin:/bin" OPENAB_PTY_TOOLS_LISTEN=127.0.0.1:8091 bash "$HOOK" >/dev/null 2>&1; then
+    ok "HOME unset: exit 0"
+else
+    not_ok "HOME unset: exit 0"
+fi
 
 echo "# $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
