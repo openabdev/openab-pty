@@ -2815,6 +2815,12 @@ mod tests {
         let total = manager.get(&name("kit")).unwrap().total_written();
         let (_gapped, _) = attach(Some(total + 1000));
         assert_eq!(kitty_answer(&spawner).await, b"\x1b[?3u");
+        // One pop shows which stack the mirror holds: the client, reset and fed
+        // the snapshot (both pushes), has [0, 5] under 3 and lands on 5. A
+        // mirror that skipped the gap reset would hold [0] and land on 0.
+        spawner.emit(b"\x1b[<u");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(kitty_answer(&spawner).await, b"\x1b[?5u");
     }
 
     #[tokio::test]

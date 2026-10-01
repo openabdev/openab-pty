@@ -258,7 +258,9 @@ fn decxpr_and_unknown_dsr_pass_through() {
 #[test]
 fn queries_the_client_leaves_unanswered_pass_through() {
     for query in [
-        &b"\x1b[=c"[..], // tertiary DA: SwiftTerm has no `=` branch
+        &b"\x1b[:c"[..], // leading `:` aborts the client's CSI parse
+        b"\x1b[::c",
+        b"\x1b[=c", // tertiary DA: SwiftTerm has no `=` branch
         b"\x1b[=0c",
         b"\x1b]4;1;?\x07", // palette: not the xterm one, not ours to report
         b"\x1b]4;1;?;9;?\x1b\\",
@@ -349,6 +351,18 @@ fn multi_group_osc_query_answers_each_colour() {
         resp,
         b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07\x1b]12;rgb:c7c7/c7c7/c7c7\x07"
     );
+}
+
+#[test]
+fn empty_osc_groups_do_not_shift_the_target() {
+    // Swift's `split` omits empty groups: `10;?;;?` is fg then bg.
+    let (_, resp) = run(b"\x1b]10;?;;?\x07");
+    assert_eq!(
+        resp,
+        b"\x1b]10;rgb:c7c7/c7c7/c7c7\x07\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+    );
+    let (_, resp) = run(b"\x1b]11;;?\x07");
+    assert_eq!(resp, b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07");
 }
 
 #[test]

@@ -24,15 +24,22 @@
 //! with the whole model by `ESC c`), bounded at 16 entries with the five
 //! known flag bits.
 //!
-//! The client's emulator is not only moved by these bytes, though: it starts
-//! fresh on a new attach and resets itself (RIS) on every `gap` frame. The
-//! session therefore calls [`CapabilityProxy::resync`] at attach — reset, then
-//! re-observe exactly the replay bytes the new client is about to be fed — so
-//! the two models start from the same place. What is still not mirrored: a
-//! `gap` raised mid-stream by a slow client's backlog overflowing (rare, and
-//! one step from a `SLOW_CLIENT` close), and the attach handoff's own
-//! chunk-boundary race. After either, `CSI ? u` can report flags the client is
-//! not encoding with until the app sets them again.
+//! The client's emulator is not only moved by these bytes, though. The
+//! runtime *assumes* a client that starts a fresh emulator on an attach with no
+//! cursor, and resets it (RIS) on a `gap` frame — what Connect does. The
+//! session therefore calls [`CapabilityProxy::resync`] at attach in exactly
+//! those two cases — reset, then re-observe the replay bytes the client is
+//! about to be fed — so the two models start from the same place. (An attach
+//! with `since=0` and nothing evicted is a contiguous replay of the whole
+//! stream: a fresh emulator fed it ends where the proxy already is.)
+//!
+//! Not mirrored: a client that handles a gap without resetting its emulator
+//! (the iPhone client only prints a marker today); a `gap` raised mid-stream by
+//! a slow client's backlog overflowing (rare, one step from a `SLOW_CLIENT`
+//! close); and the attach handoff's chunk-boundary race (a chunk the proxy has
+//! seen but the ring has not yet stored when the snapshot is taken). After any
+//! of these, `CSI ? u` can disagree with the client until the app sets its
+//! flags again — no worse than the static `?0u` this replaced.
 //!
 //! **Parameters are numeric.** `CSI 00 c` and `CSI 05 n` are the same queries
 //! as `CSI c` / `CSI 5 n` — SwiftTerm's parser accumulates digits, so the
@@ -252,6 +259,13 @@ impl CapabilityProxy {
         } else {
             2
         };
+        // A `:` straight after `CSI` is a parse error in the client's entry
+        // state (the sequence aborts and the final byte is printed), so it is
+        // no query there and none here. After a private marker the client is
+        // already in its parameter state, where `:` separates like `;`.
+        if private.is_none() && s.get(2) == Some(&b':') {
+            return Inspection::Unknown;
+        }
         while i < s.len() && i <= MAX_SEQUENCE_LEN {
             let b = s[i];
             match b {
@@ -428,9 +442,8 @@ fn answer(consume: usize, response: Vec<u8>) -> Match {
 /// Parse a CSI parameter list: `;` and `:` both open a new slot, empty slots
 /// are 0, values saturate at 65535, and more than 24 slots is `None` — the
 /// client's parser refuses to dispatch such a sequence. An empty parameter list
-/// still yields `[0]`. (Unlike the client, a *leading* `:` is accepted here as
-/// an empty first slot; the client's entry state rejects it. No query this
-/// proxy answers is reachable that way with a different result.)
+/// still yields `[0]`. A `:` leading a non-private CSI never gets here — see
+/// `inspect_csi`.
 fn parse_params(params: &[u8]) -> Option<([u16; 24], usize)> {
     let mut pars = [0u16; 24];
     let mut count = 0usize;
@@ -512,7 +525,13 @@ fn classify_osc_query(s: &[u8]) -> Option<Match> {
 /// colour in a live slot is a set and makes the whole sequence passthrough.
 fn osc_face_colour(base: u32, rest: &[u8], len: usize, terminator: &[u8]) -> Option<Match> {
     let mut response = Vec::new();
-    for (offset, group) in rest.split(|&b| b == b';').enumerate() {
+    // Empty groups are dropped before indexing, as Swift's `split` does:
+    // `OSC 10;?;;?` is fg then bg there, not fg then cursor.
+    for (offset, group) in rest
+        .split(|&b| b == b';')
+        .filter(|group| !group.is_empty())
+        .enumerate()
+    {
         let target = base as usize + offset;
         if group.first() == Some(&b'?') {
             let colour = match target {

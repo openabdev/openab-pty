@@ -159,12 +159,14 @@ Two behaviours of that proxy are worth knowing. The kitty query (`CSI ? u`) is
 answered with the flag state the client actually applied: the runtime watches
 `CSI >` / `CSI <` / `CSI = … u` (push/pop/set) go by on their way to you and keeps
 the same per-screen stack your emulator does, so an app that pushes flags and then
-queries is told its push succeeded. The mirror assumes a SwiftTerm-like client:
-it is reset at attach — your emulator is taken to start fresh on an attach without
-`?since=`, and to reset (RIS) on a `gap` frame, as §4.1 requires — and then
-replays the bytes you are about to be sent. A mid-stream `gap` from a backlog
-overflow is not mirrored, so after one the kitty answer can be stale until the
-app sets its flags again. And OSC replies reuse the query's own
+queries is told its push succeeded. The mirror **assumes** what Connect does: a
+fresh emulator on an attach without `?since=`, and an emulator reset (RIS /
+`resetToInitialState`) as the way you clear-and-redraw on a `gap`. In those two
+cases the runtime resets its mirror and re-reads the replay you are about to be
+sent; a contiguous resume (including `?since=0` with nothing evicted) keeps it.
+If your client clears a gap without resetting its emulator, or after a
+mid-stream backlog `gap`, the kitty answer can disagree with your emulator until
+the app sets its flags again. And OSC replies reuse the query's own
 terminator — a `BEL`-terminated query gets a `BEL`-terminated reply — rather than
 always `ESC \`; both are legal, and echoing the query's framing is what xterm
 does.
