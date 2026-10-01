@@ -1506,6 +1506,23 @@ impl SessionManager {
             teardown_best_effort: session.tier_best_effort,
             externalise_with: "git push (lifecycle hooks are backup, not primary)",
         });
+        // Bring the kitty mirror in line with the emulator this client is about
+        // to have: one that starts fresh (no cursor: a new view) or resets on
+        // the gap frame (contract §4.1), and is then fed exactly `replay`. A
+        // contiguous resume continues the client's existing emulator, which
+        // already matches. See `CapabilityProxy::resync`.
+        let client_starts_fresh = since.is_none() || matches!(replay, Some(Replay::Gap { .. }));
+        if client_starts_fresh {
+            if let Some(proxy) = &session.proxy {
+                let fed: &[u8] = match &replay {
+                    Some(Replay::Contiguous { bytes, .. }) | Some(Replay::Gap { bytes, .. }) => {
+                        bytes
+                    }
+                    None => &[],
+                };
+                proxy.lock().resync(fed);
+            }
+        }
         if let Some(replay) = replay {
             match replay {
                 Replay::Contiguous { bytes, .. } => outbound.push_bytes(&bytes),
@@ -2711,7 +2728,7 @@ mod tests {
             )
             .unwrap();
 
-        let replies = b"\x1b[?0u\x1b[?65;1;2;6;21;22;17;28c\x1b[24;80R";
+        let replies = b"\x1b[?0u\x1b[?65;4;1;2;6;21;22;17;28c\x1b[24;80R";
         attached.write_input(replies).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(spawner.written.lock().as_slice(), replies);
@@ -2738,12 +2755,66 @@ mod tests {
 
         assert_eq!(
             spawner.written.lock().as_slice(),
-            b"\x1b[?65;1;2;6;21;22;17;28c",
+            b"\x1b[?65;4;1;2;6;21;22;17;28c",
             "runtime must answer the DA query back to the child"
         );
         let items = drain(&attached.outbound);
         assert_eq!(collected_bytes(&items), b"promptdone");
         assert_eq!(manager.get(&name("cap")).unwrap().total_written(), 10);
+    }
+
+    /// Ask the child-side proxy for its kitty flags and return what it wrote
+    /// back to the child, clearing the record first.
+    async fn kitty_answer(spawner: &FakeSpawner) -> Vec<u8> {
+        spawner.written.lock().clear();
+        spawner.emit(b"\x1b[?u");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        spawner.written.lock().clone()
+    }
+
+    #[tokio::test]
+    async fn the_kitty_mirror_follows_the_clients_emulator_across_attaches() {
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(
+            spawner.clone(),
+            "scrollback_replay = false",
+            SessionPolicy::default(),
+        );
+        let created = manager.create(name("kit"), WindowSize::default()).unwrap();
+        let attach = |since| {
+            manager
+                .attach_with_replay(
+                    &name("kit"),
+                    created.generation,
+                    WindowSize::default(),
+                    None,
+                    since,
+                )
+                .unwrap()
+        };
+
+        // A push with a client attached: the client applied it.
+        let (_first, _) = attach(None);
+        spawner.emit(b"\x1b[>5u");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(kitty_answer(&spawner).await, b"\x1b[?5u");
+
+        // A contiguous resume continues that client's emulator: state kept.
+        let offset = manager.get(&name("kit")).unwrap().total_written();
+        let (_resumed, _) = attach(Some(offset));
+        assert_eq!(kitty_answer(&spawner).await, b"\x1b[?5u");
+
+        // A fresh view (no cursor, no replay) starts from a fresh emulator.
+        let (_fresh, _) = attach(None);
+        assert_eq!(kitty_answer(&spawner).await, b"\x1b[?0u");
+
+        // A cursor the ring cannot honour is a gap: the client resets, then is
+        // fed the retained tail — which here re-applies a push.
+        spawner.emit(b"\x1b[>3u");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let total = manager.get(&name("kit")).unwrap().total_written();
+        let (_gapped, _) = attach(Some(total + 1000));
+        assert_eq!(kitty_answer(&spawner).await, b"\x1b[?3u");
     }
 
     #[tokio::test]
@@ -2758,7 +2829,7 @@ mod tests {
 
         assert_eq!(
             spawner.written.lock().as_slice(),
-            b"\x1b[?65;1;2;6;21;22;17;28c",
+            b"\x1b[?65;4;1;2;6;21;22;17;28c",
             "a detached session must answer without a client"
         );
     }

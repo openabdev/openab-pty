@@ -144,6 +144,7 @@ One line each; the authoritative doc comment is at the top of each file.
 | `admin_auth.rs` | admin credential verification | `sha256:` verifier only, constant-time compare; a success clears the source's throttle bucket, so a correct credential is never lockable |
 | `killdomain.rs` | Tier 1 teardown | attribution (pidfd/subreaper) and termination (process group) solved separately |
 | `ringbuf.rs` | output-path buffers | *every* buffer on the PTY→client path is bounded (ADR MUST); overflow surfaces as a `gap` control frame, never a sliced stream |
+| `capproxy.rs` | static capability-query answers | PTY→client queries answered at the source and stripped; kitty flags tracked per screen because a static `?0u` would lie about a client's push |
 | `termfilter.rs` | capability-reply filtering | client→PTY direction **only**; PTY→client is verbatim by design (contract §4.1) |
 | `containment.rs` | transient-secret containment | file permissions do not isolate same-UID processes; dumpable=0 is the barrier |
 | `config.rs` | projection validation | this crate never resolves cloud secrets; the projection is materialized outside the PTY trust boundary |

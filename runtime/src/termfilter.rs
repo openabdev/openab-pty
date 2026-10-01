@@ -11,11 +11,13 @@
 //! behave.
 //!
 //! Only the responses are stripped. Everything a human or a mouse can produce
-//! passes through byte-for-byte, which is why the finals we strip are limited to
-//! `c` (DA) and `n` (DSR): no key, mouse, focus, bracketed-paste or
-//! Kitty-keyboard encoding a terminal sends to an application uses them. `R`
-//! (CPR) is deliberately left through — the runtime does not proxy CPR, so the
-//! client's answer must reach the child.
+//! passes through byte-for-byte, which is why the shapes we strip are limited
+//! to forms a terminal only emits as an answer: `c` (DA), `n` (DSR), the
+//! `?`-prefixed `u` final (kitty flag report — key events are digit-led, so
+//! `?` cannot collide with them), the `*`-marked `{` final (macro space
+//! report) and the DCS `!~` checksum report. `R` (CPR) is deliberately left
+//! through — the runtime does not proxy CPR, so the client's answer must reach
+//! the child.
 //!
 //! **Chunk-scoped by design.** The filter holds no cross-call state: an escape
 //! sequence split across two WebSocket frames passes through unfiltered. The
@@ -113,9 +115,12 @@ fn classify(s: &[u8]) -> Option<usize> {
 
 /// `CSI ... c` (Device Attributes) and `CSI ... n` (Device Status Report) are
 /// responses answered at the source; `CSI ... R` (CPR) is left through so the
-/// client can answer what the runtime cannot. Every other final byte
-/// belongs to input a terminal legitimately sends: `A`–`D` arrows, `~` tilde
-/// keys and bracketed paste, `M`/`m` mouse, `I`/`O` focus, `u` Kitty keyboard.
+/// client can answer what the runtime cannot. Two more finals are stripped
+/// only in their response-specific forms: `?`-led `u` (kitty flag report —
+/// digit-led `u` is kitty keyboard input and passes) and `*`-marked `{`
+/// (macro space report). Every other final byte belongs to input a terminal
+/// legitimately sends: `A`–`D` arrows, `~` tilde keys and bracketed paste,
+/// `M`/`m` mouse, `I`/`O` focus.
 fn classify_csi(s: &[u8]) -> Option<usize> {
     let mut i = 2;
     while i < s.len() && i <= MAX_SEQUENCE_LEN {
@@ -128,10 +133,15 @@ fn classify_csi(s: &[u8]) -> Option<usize> {
             0x40..=0x7e => {
                 // `R` (CPR) is intentionally NOT stripped: the runtime does
                 // not answer CPR (no screen state), so the client's CPR reply
-                // must be allowed through to the child. DA (`c`) and DSR (`n`)
-                // are answered at the source by CapabilityProxy and any client
-                // echo of them here is redundant, so they stay filtered.
-                return if matches!(b, b'c' | b'n') {
+                // must be allowed through to the child. DA (`c`), DSR (`n`),
+                // the kitty flag report (`?`-led `u`) and the macro space
+                // report (`*`-marked `{`) are answered at the source by
+                // CapabilityProxy — a client echo of them here is redundant,
+                // so they stay filtered.
+                return if matches!(b, b'c' | b'n')
+                    || (b == b'u' && s.get(2) == Some(&b'?'))
+                    || (b == b'{' && s[2..i].contains(&b'*'))
+                {
                     Some(i + 1)
                 } else {
                     None
@@ -173,10 +183,10 @@ fn classify_osc(s: &[u8]) -> Option<usize> {
     None
 }
 
-/// DCS report shapes: tertiary DA (`DCS ! | ...`), XTVERSION (`DCS > | ...`),
-/// DECRQSS answers (`DCS 0$r` / `DCS 1$r`) and XTGETTCAP answers
-/// (`DCS 0+r` / `DCS 1+r`). Other DCS payloads are passed through rather than
-/// assumed to be replies.
+/// DCS report shapes: tertiary DA (`DCS ! | ...`), macro checksum reports
+/// (`DCS <id> ! ~ <hex>`), XTVERSION (`DCS > | ...`), DECRQSS answers
+/// (`DCS 0$r` / `DCS 1$r`) and XTGETTCAP answers (`DCS 0+r` / `DCS 1+r`).
+/// Other DCS payloads are passed through rather than assumed to be replies.
 fn classify_dcs(s: &[u8]) -> Option<usize> {
     let (payload, len) = string_sequence(s, 2)?;
     let mut j = 0;
@@ -185,6 +195,7 @@ fn classify_dcs(s: &[u8]) -> Option<usize> {
     }
     let rest = &payload[j..];
     if rest.starts_with(b"!|")
+        || rest.starts_with(b"!~")
         || rest.starts_with(b">|")
         || rest.starts_with(b"$r")
         || rest.starts_with(b"+r")
@@ -200,8 +211,9 @@ fn classify_dcs(s: &[u8]) -> Option<usize> {
 /// Returns the payload and the total sequence length including the terminator.
 fn string_sequence(s: &[u8], body: usize) -> Option<(&[u8], usize)> {
     let mut i = body;
-    let limit = s.len().min(MAX_SEQUENCE_LEN);
-    while i < limit {
+    // Same bound as the CSI scan (and the proxy's): the terminator is found
+    // through index MAX_SEQUENCE_LEN, keeping the two directions consistent.
+    while i < s.len() && i <= MAX_SEQUENCE_LEN {
         if s[i] == BEL {
             return Some((&s[body..i], i + 1));
         }
@@ -257,6 +269,52 @@ mod tests {
         assert!(filtered(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07").is_empty());
         assert!(filtered(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\").is_empty());
         assert!(filtered(b"\x1b]4;1;rgb:cd00/0000/0000\x07").is_empty());
+    }
+
+    #[test]
+    fn strips_the_newer_proxied_reply_shapes() {
+        // Everything CapabilityProxy can emit must also be stripped here —
+        // otherwise a client echo of a split query leaks a duplicate reply
+        // into the child.
+        assert!(filtered(b"\x1b[?5u").is_empty(), "kitty flag report");
+        assert!(filtered(b"\x1b[?0u").is_empty(), "kitty report, no flags");
+        assert!(filtered(b"\x1b[0*{").is_empty(), "macro space report");
+        assert!(
+            filtered(b"\x1bP7!~0000\x1b\\").is_empty(),
+            "checksum report"
+        );
+        assert!(
+            filtered(b"\x1b]12;rgb:c7c7/c7c7/c7c7\x07").is_empty(),
+            "cursor colour report"
+        );
+    }
+
+    #[test]
+    fn response_shapes_are_stripped_only_in_their_report_form() {
+        // Kitty key events are digit-led `u` — never `?`-led — so they pass.
+        assert_eq!(filtered(b"\x1b[97;5u"), b"\x1b[97;5u", "key event");
+        assert_eq!(
+            filtered(b"\x1b[=1u"),
+            b"\x1b[=1u",
+            "`=`-led is not a report"
+        );
+        // `{` without the `*` marker is not the macro space report.
+        assert_eq!(filtered(b"\x1b[5{"), b"\x1b[5{");
+    }
+
+    #[test]
+    fn scan_bound_matches_the_proxy_at_the_limit() {
+        // Both directions allow the terminator through index MAX_SEQUENCE_LEN:
+        // a DCS checksum reply whose ST lands exactly on the bound still
+        // strips; one byte longer does not.
+        let mut at_limit = Vec::from(&b"\x1bP"[..]);
+        at_limit.extend_from_slice(&vec![b'0'; MAX_SEQUENCE_LEN - 8]);
+        at_limit.extend_from_slice(b"!~0000\x1b\\");
+        assert!(filtered(&at_limit).is_empty(), "ST ESC at the bound strips");
+        let mut over = Vec::from(&b"\x1bP"[..]);
+        over.extend_from_slice(&vec![b'0'; MAX_SEQUENCE_LEN - 7]);
+        over.extend_from_slice(b"!~0000\x1b\\");
+        assert_eq!(filtered(&over), over, "ST ESC past the bound passes");
     }
 
     #[test]
