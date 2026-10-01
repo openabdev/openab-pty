@@ -15,9 +15,9 @@
 //! to forms a terminal only emits as an answer: `c` (DA), `n` (DSR), the
 //! `?`-prefixed `u` final (kitty flag report — key events are digit-led, so
 //! `?` cannot collide with them), the `*`-marked `{` final (macro space
-//! report) and the DCS `!~` checksum report. `R` (CPR) is deliberately left
-//! through — the runtime does not proxy CPR, so the client's answer must reach
-//! the child.
+//! report) and the DCS `!~` checksum report. `R` (CPR), `OSC 4` (palette) and
+//! DCS `>|` (XTVERSION) are deliberately left through — the runtime does not
+//! proxy them, so the client's answer must reach the child.
 //!
 //! **Chunk-scoped by design.** The filter holds no cross-call state: an escape
 //! sequence split across two WebSocket frames passes through unfiltered. The
@@ -156,9 +156,10 @@ fn classify_csi(s: &[u8]) -> Option<usize> {
 }
 
 /// OSC color reports: `OSC Ps ; rgb:<...> ST|BEL`, e.g. the `OSC 10`/`OSC 11`
-/// foreground/background answers and `OSC 4 ; n ; rgb:` palette answers.
-/// Deliberately narrow: only payloads carrying an `rgb:`/`rgba:` reply are
-/// stripped, so any other OSC use passes untouched.
+/// foreground/background answers and `OSC 12` cursor answers.
+/// Deliberately narrow: only payloads carrying an `rgb:`/`rgba:` reply for
+/// proxied colour queries (10, 11, 12) are stripped; `OSC 4` palette answers
+/// pass through to the child, matching CPR.
 fn classify_osc(s: &[u8]) -> Option<usize> {
     let (payload, len) = string_sequence(s, 2)?;
     let mut j = 0;
@@ -169,23 +170,20 @@ fn classify_osc(s: &[u8]) -> Option<usize> {
     if j == 0 || payload.get(j) != Some(&b';') {
         return None;
     }
-    if payload[j..].starts_with(b";rgb:") || payload[j..].starts_with(b";rgba:") {
-        return Some(len);
+    let ps = &payload[..j];
+    if matches!(ps, b"10" | b"11" | b"12")
+        && (payload[j..].starts_with(b";rgb:") || payload[j..].starts_with(b";rgba:"))
+    {
+        Some(len)
+    } else {
+        None
     }
-    // `OSC 4 ; <index> ; rgb:` — one extra numeric group.
-    let mut k = j + 1;
-    while k < payload.len() && payload[k].is_ascii_digit() {
-        k += 1;
-    }
-    if k > j + 1 && (payload[k..].starts_with(b";rgb:") || payload[k..].starts_with(b";rgba:")) {
-        return Some(len);
-    }
-    None
 }
 
 /// DCS report shapes: tertiary DA (`DCS ! | ...`), macro checksum reports
-/// (`DCS <id> ! ~ <hex>`), XTVERSION (`DCS > | ...`), DECRQSS answers
-/// (`DCS 0$r` / `DCS 1$r`) and XTGETTCAP answers (`DCS 0+r` / `DCS 1+r`).
+/// (`DCS <id> ! ~ <hex>`), DECRQSS answers (`DCS 0$r` / `DCS 1$r`) and
+/// XTGETTCAP answers (`DCS 0+r` / `DCS 1+r`). XTVERSION (`DCS > | ...`) is
+/// deliberately left through so the client's version report reaches the child.
 /// Other DCS payloads are passed through rather than assumed to be replies.
 fn classify_dcs(s: &[u8]) -> Option<usize> {
     let (payload, len) = string_sequence(s, 2)?;
@@ -196,7 +194,6 @@ fn classify_dcs(s: &[u8]) -> Option<usize> {
     let rest = &payload[j..];
     if rest.starts_with(b"!|")
         || rest.starts_with(b"!~")
-        || rest.starts_with(b">|")
         || rest.starts_with(b"$r")
         || rest.starts_with(b"+r")
         || rest.starts_with(b"+R")
@@ -241,10 +238,30 @@ mod tests {
     }
 
     #[test]
-    fn passes_cursor_position_report_for_the_child_to_receive() {
-        // CPR is not proxied, so the client's answer must reach the child.
+    fn passes_unproxied_replies_for_the_child_to_receive() {
+        // CPR, OSC 4 palette and XTVERSION are not proxied, so the client's
+        // answers must reach the child.
         assert_eq!(filtered(b"\x1b[24;80R"), b"\x1b[24;80R");
         assert_eq!(filtered(b"\x1b[?24;80;1R"), b"\x1b[?24;80;1R", "DECXCPR");
+        assert_eq!(
+            filtered(b"\x1b]4;1;rgb:cd00/0000/0000\x07"),
+            b"\x1b]4;1;rgb:cd00/0000/0000\x07",
+            "OSC 4 palette BEL"
+        );
+        assert_eq!(
+            filtered(b"\x1b]4;255;rgb:ffff/ffff/ffff\x1b\\"),
+            b"\x1b]4;255;rgb:ffff/ffff/ffff\x1b\\",
+            "OSC 4 palette ST"
+        );
+        assert_eq!(
+            filtered(b"\x1bP>|xterm.js(5.3.0)\x1b\\"),
+            b"\x1bP>|xterm.js(5.3.0)\x1b\\",
+            "XTVERSION"
+        );
+        assert_eq!(
+            filtered(b"\x1bP>|SwiftTerm 1.19\x1b\\"),
+            b"\x1bP>|SwiftTerm 1.19\x1b\\"
+        );
     }
 
     #[test]
@@ -254,9 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn strips_tertiary_da_and_xtversion_dcs() {
+    fn strips_tertiary_da_and_decrqss_dcs() {
         assert!(filtered(b"\x1bP!|7E565445\x1b\\").is_empty());
-        assert!(filtered(b"\x1bP>|xterm.js(5.3.0)\x1b\\").is_empty());
         assert!(filtered(b"\x1bP1$r0;1m\x1b\\").is_empty(), "DECRQSS answer");
         assert!(
             filtered(b"\x1bP1+r544e=787465726d\x07").is_empty(),
@@ -268,7 +284,7 @@ mod tests {
     fn strips_osc_color_reports() {
         assert!(filtered(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07").is_empty());
         assert!(filtered(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\").is_empty());
-        assert!(filtered(b"\x1b]4;1;rgb:cd00/0000/0000\x07").is_empty());
+        assert!(filtered(b"\x1b]12;rgb:c7c7/c7c7/c7c7\x07").is_empty());
     }
 
     #[test]

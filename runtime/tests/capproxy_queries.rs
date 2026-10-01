@@ -442,6 +442,32 @@ fn every_answer_shape_the_proxy_emits_is_filtered_on_the_way_back() {
 }
 
 // ---------------------------------------------------------------------------
+// Unproxied reply passthrough (#53) — queries the proxy leaves to the client
+// (OSC 4 palette, XTVERSION DCS >|, and CPR) must not have their client replies
+// eaten by TermFilter on the way back to the child.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn client_replies_to_unproxied_queries_reach_child() {
+    use openab_pty::termfilter::TermFilter;
+    let mut filter = TermFilter::new();
+    for reply in [
+        &b"\x1b[24;80R"[..],                    // CPR
+        b"\x1b[?24;80;1R",                      // DECXCPR
+        b"\x1b]4;1;rgb:cd00/0000/0000\x07",     // OSC 4 palette reply (BEL)
+        b"\x1b]4;255;rgb:ffff/ffff/ffff\x1b\\", // OSC 4 palette reply (ST)
+        b"\x1bP>|SwiftTerm 1.19\x1b\\",         // XTVERSION
+        b"\x1bP>|xterm.js(5.3.0)\x1b\\",
+    ] {
+        assert_eq!(
+            filter.filter(reply).as_ref(),
+            reply,
+            "unproxied reply shape must pass to the child: {reply:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interleaving with real output — answers concatenate in query order.
 // ---------------------------------------------------------------------------
 
