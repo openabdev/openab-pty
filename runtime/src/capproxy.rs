@@ -82,9 +82,11 @@
 //!   live cursor state — a screen model, not a byte filter. Follow-up: a
 //!   thin VT-state reader (libghostty-vt or equivalent) so even this is
 //!   answered at the source without a client.
-//! - **Colour sets, `OSC 4`, XTVERSION, tertiary DA and unrecognised DSR `?` queries**
-//!   — the client owns them; the filter on the input side lets client
-//!   replies to `OSC 4` and XTVERSION reach the child, matching CPR.
+//! - **Colour sets, `OSC 4`, XTVERSION, tertiary DA, DECRQSS, XTGETTCAP and
+//!   unrecognised DSR `?` queries** — the client owns them; the filter on the
+//!   input side lets the client's replies reach the child, matching CPR. (DSR
+//!   `?` replies are the exception: they share the `n` final with answers
+//!   this proxy emits, so the filter strips them all. See `termfilter.rs`.)
 //!
 //! The filter direction is the mirror of this proxy — `termfilter.rs`
 //! answers the "who ate my reply" question by deleting client→PTY copies of
