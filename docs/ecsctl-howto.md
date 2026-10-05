@@ -68,6 +68,13 @@ Two shapes, both in [`deploy/ecs/`](../deploy/ecs/):
 | [`pty-kiro.yaml`](../deploy/ecs/pty-kiro.yaml) | 3 | openab-pty on its own — the diagram above |
 | [`kiro-with-pty.yaml`](../deploy/ecs/kiro-with-pty.yaml) | 4 | An agent **and** a terminal into the same `/workspace` — the adjacency case this runtime exists for |
 
+`kiro-with-pty.yaml` predates the first-class colocated shape: its broker
+container pulls `openab:` while the terminal pulls `openab-pty:`, even though
+the pty image *is* the openab image plus a static binary. For the same-image
+form of that stanza, the k8s equivalents, and the trust model — including what
+the task-wide role means now that a broker holds one — see
+[`colocated-openab.md`](colocated-openab.md).
+
 The four-container shape adds the agent to the same volume, which is the point
 and also the thing to understand before deploying it:
 

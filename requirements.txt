@@ -1,0 +1,4 @@
+# Test tooling for tests/ — `python3 -m pytest -q` from the repo root.
+# Not installed by CI automatically; the fleet environment already carries both.
+pytest>=8
+pyyaml>=6

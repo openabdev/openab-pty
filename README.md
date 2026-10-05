@@ -123,6 +123,7 @@ credential, and an attach token authorises exactly one session and expires.
 | `deploy/` | Kubernetes pod and ECS Fargate task definitions, both verified. |
 | [`docs/k8s-howto.md`](docs/k8s-howto.md) | Deploying on Kubernetes, including the failures worth knowing about in advance. |
 | [`docs/ecsctl-howto.md`](docs/ecsctl-howto.md) | Deploying on ECS Fargate with `ecsctl`, same. Operator notes. |
+| [`docs/colocated-openab.md`](docs/colocated-openab.md) | Running a classic `openab` broker beside the terminal on one `/workspace` — manifests, token rules, trust model. |
 
 There is no client in this repository. The contract above is the interface;
 [`OpenAB Connect`](https://openab.dev) is one implementation of it and is not open

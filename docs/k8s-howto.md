@@ -4,7 +4,10 @@ Operator notes. The manifest is [`deploy/k8s/pod-tailscale.yaml`](../deploy/k8s/
 this explains what it needs around it and which failures you should expect on the
 way. Verified on k3s (including OrbStack).
 
-For ECS Fargate instead, see [`ecsctl-howto.md`](ecsctl-howto.md).
+For ECS Fargate instead, see [`ecsctl-howto.md`](ecsctl-howto.md). To run a
+classic `openab` broker beside the terminal over the same `/workspace`, see
+[`colocated-openab.md`](colocated-openab.md) — same image, entrypoint override,
+plus the trust model that shape implies.
 
 ## Shape of the thing
 

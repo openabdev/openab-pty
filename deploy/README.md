@@ -37,6 +37,17 @@ are documented anywhere obvious:
 Replace `SUFFIX` in the secret ARN with the real one, and point the image at your
 own registry.
 
+## Colocated — openab-pty + classic openab on one `/workspace`
+
+[`ecs/kiro-with-pty.yaml`](ecs/kiro-with-pty.yaml) is the adjacency shape on ECS:
+a brokered agent and a terminal into the same workspace in one task. For the
+first-class version of that shape — the broker running from the *same* image
+with an entrypoint override, the k8s variant-C/variant-B manifests, the token
+rules, and the trust model that comes with sharing `/workspace` — see
+[`../docs/colocated-openab.md`](../docs/colocated-openab.md). Its yaml blocks
+are the canonical manifests; `tests/test_colocated_openab.py` pins the
+properties they must keep.
+
 ## CI-built images (GHCR, public)
 
 `.github/workflows/image.yml` builds this Dockerfile on every push to `main` and
