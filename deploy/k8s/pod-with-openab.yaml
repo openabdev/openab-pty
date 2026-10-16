@@ -1,0 +1,213 @@
+# openab-pty + classic openab in one pod: the colocated shape (#62, ADR
+# mechanism C).
+#
+# This is pod-tailscale.yaml plus a third container that runs `openab run` (a
+# Discord bot driving kiro-cli over ACP) against the SAME /workspace the
+# terminal opens in. A human in the PTY and the chat-driven agent work on one
+# tree. Read docs/colocated-openab.md before deploying; the short version:
+#
+#   - /workspace is ONE trust zone. A session shell can plant config that the
+#     bot's kiro-cli executes, and a Discord prompt can write files the shell
+#     later runs. Do not colocate a bot whose token you would not hand to every
+#     terminal session.
+#   - Everything else is per container: the Discord token reaches `openab`
+#     only, PTY_ADMIN_HASH reaches `openab-pty` only, each has its own /tmp.
+#
+# The broker runs from the SAME image as the terminal, with the entrypoint
+# overridden: the image is FROM ghcr.io/openabdev/openab, so `openab`, the agent
+# CLI and uid 1000 are already there. One pull, and both sides are guaranteed to
+# run the same CLI version. Keep the two `image:` lines identical; pin both to
+# the immutable `<variant>-<sha>` tag in anything you need to reproduce.
+#
+# Verified on k3s v1.36.2 with openab 0.10.0 / kiro-cli 2.13.0: `openab run`
+# needs nothing writable outside /workspace and its own /tmp, so it carries the
+# same readOnlyRootFilesystem + drop ALL as the terminal.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: openab-pty-colocated
+  namespace: openab-pty
+  labels:
+    # Kept identical to pod-tailscale.yaml so networkpolicy-no-tailnet-egress.yaml
+    # selects this pod too: the bot's agent has shell tools as well.
+    app: openab-pty
+spec:
+  automountServiceAccountToken: false
+  # Not `Never` as in pod-tailscale.yaml: a bad or reset Discord token makes
+  # `openab run` exit 1, and that must restart the bot, not leave it dead in a
+  # pod whose terminal is still serving. Kubernetes restart policy is pod-wide,
+  # so a crashed runtime or sidecar is restarted in place too; with `Never` it
+  # would have ended the pod.
+  restartPolicy: OnFailure
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    # ---------------------------------------------------------------- tailscale
+    # Unchanged from pod-tailscale.yaml. Note what it implies here: userspace
+    # tailscaled forwards inbound tailnet TCP to EVERY loopback port in the pod,
+    # not only the terminal's. The bot below therefore runs with no listener at
+    # all — no [mcp] section, OPENAB_ACP_ENABLED unset. Turning either on makes
+    # it tailnet-reachable; do it only with an auth key.
+    - name: tailscale
+      image: tailscale/tailscale:stable
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef: { name: openab-pty-tailscale, key: authkey }
+        - name: TS_USERSPACE
+          value: "true"
+        - name: TS_HOSTNAME
+          value: "openab-pty-colocated"
+        - name: TS_STATE_DIR
+          value: /tmp/tsstate
+        - name: TS_KUBE_SECRET
+          value: ""
+        - name: TS_EXTRA_ARGS
+          value: "--accept-dns=false"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { memory: 64Mi, cpu: 50m }
+        limits: { memory: 192Mi, cpu: 500m }
+      volumeMounts:
+        - name: ts-state
+          mountPath: /tmp/tsstate
+        - name: ts-tmp
+          mountPath: /tmp
+
+    # --------------------------------------------------------------- openab-pty
+    # Unchanged from pod-tailscale.yaml. The tools plane may stay on: its
+    # startup hook writes `mcpServers.computer` into the shared
+    # ~/.kiro/settings/mcp.json, and the bot below runs kiro-cli under its own
+    # agent with `includeMcpJson: false`, so it never dials that server.
+    - name: openab-pty
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: PTY_ADMIN_HASH
+          valueFrom:
+            secretKeyRef: { name: openab-pty, key: admin-hash }
+        - name: PTY_MAX_SESSIONS
+          value: "3"
+        - name: PTY_ABSOLUTE_TTL
+          value: 12h
+        - name: PTY_IDLE_TTL
+          value: 8h
+        - name: PTY_TOOLS_LISTEN
+          value: 127.0.0.1:8091
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { memory: 128Mi, cpu: 100m }
+        limits: { memory: 512Mi, cpu: "1" }
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: runtime-state
+          mountPath: /run/openab-pty
+        - name: pty-tmp
+          mountPath: /tmp
+
+    # ------------------------------------------------------------------- openab
+    # The classic broker: same image, entrypoint overridden. tini is in the
+    # base image and reaps kiro-cli's children; `-g` signals the whole group on
+    # shutdown.
+    - name: openab
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          umask 077
+          # The config arrives as a non-secret env var; ${DISCORD_BOT_TOKEN}
+          # inside it stays literal here and is expanded by openab itself.
+          printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml
+          # The bot's own kiro agent. `includeMcpJson: false` keeps the shared
+          # ~/.kiro/settings/mcp.json out of the bot's sessions: that file
+          # carries the terminal's `computer` server, whose Bearer token exists
+          # only in a PTY session's environment, so the bot would get a 401 and
+          # a server_init_failure on every session (measured, kiro-cli 2.13.0).
+          mkdir -p "$HOME/.kiro/agents"
+          printf '%s\n' '{"name":"openab-bot","description":"Colocated openab broker agent (openab-pty#62)","tools":["*"],"allowedTools":["*"],"includeMcpJson":false}' \
+            > "$HOME/.kiro/agents/openab-bot.json"
+          exec openab run -c /tmp/openab.toml
+      env:
+        # Same HOME as the terminal: one agent login, one tree. This is the
+        # point of the shape and also why /workspace is one trust zone.
+        - name: HOME
+          value: /workspace
+        - name: RUST_LOG
+          value: info
+        # Out of /workspace, so a session shell cannot reach the broker's
+        # control socket. Point it into /workspace only if you deliberately
+        # want `openab agent …` from the terminal ([control_plane] primary).
+        - name: OPENAB_AGENT_SOCKET
+          value: /tmp/openab-run/agent.sock
+        # The only platform secret, on this container alone. Never as a
+        # PTY_FORWARD_* on openab-pty: that would put it in every session.
+        - name: DISCORD_BOT_TOKEN
+          valueFrom:
+            secretKeyRef: { name: openab-pty-colocated-discord, key: bot-token }
+        # Non-secret: the token is referenced, not embedded. A remote config
+        # works too: `openab run -c s3://<bucket>/<key>` or `-c https://…`.
+        - name: OPENAB_CONFIG_TOML
+          value: |
+            [discord]
+            bot_token = "${DISCORD_BOT_TOKEN}"
+            allowed_channels = ["REPLACE_WITH_CHANNEL_ID"]
+
+            [agent]
+            command = "kiro-cli"
+            args = ["acp", "--trust-all-tools", "--agent", "openab-bot"]
+            working_dir = "/workspace"
+
+            [pool]
+            # Each kiro-cli acp session is a few hundred MiB; size the
+            # container limit below against this.
+            max_sessions = 2
+            session_ttl_hours = 24
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { memory: 512Mi, cpu: 250m }
+        limits: { memory: 2Gi, cpu: "2" }
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        # Its own /tmp, never the terminal's: it holds the rendered config and
+        # the broker's sockets (/tmp/openab.sock, OPENAB_AGENT_SOCKET).
+        - name: oab-tmp
+          mountPath: /tmp
+
+  volumes:
+    # emptyDir like pod-tailscale.yaml: the workspace, and with it the agent
+    # login, is lost when the pod is replaced. Swap in a PVC to keep it.
+    - name: workspace
+      emptyDir: {}
+    - name: runtime-state
+      emptyDir: { medium: Memory, sizeLimit: 16Mi }
+    - name: pty-tmp
+      emptyDir: { sizeLimit: 512Mi }
+    - name: oab-tmp
+      emptyDir: { sizeLimit: 512Mi }
+    - name: ts-state
+      emptyDir: {}
+    - name: ts-tmp
+      emptyDir: {}
