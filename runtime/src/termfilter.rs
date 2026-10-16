@@ -15,9 +15,28 @@
 //! to forms a terminal only emits as an answer: `c` (DA), `n` (DSR), the
 //! `?`-prefixed `u` final (kitty flag report — key events are digit-led, so
 //! `?` cannot collide with them), the `*`-marked `{` final (macro space
-//! report) and the DCS `!~` checksum report. `R` (CPR), `OSC 4` (palette) and
-//! DCS `>|` (XTVERSION) are deliberately left through — the runtime does not
-//! proxy them, so the client's answer must reach the child.
+//! report), the `OSC 10/11/12` colour reports and the DCS `!~` checksum report.
+//!
+//! **The rule: strip the reply shapes `CapabilityProxy` emits, and only
+//! those.** A client answer to a query the proxy answers itself is a
+//! duplicate; a client answer to a query the proxy passes through is the only
+//! answer the app will get, so it must reach the child. `R` (CPR), `OSC 4`
+//! (palette) and the DCS replies — `>|` (XTVERSION), `!|` (tertiary DA), `$r`
+//! (DECRQSS) and `+r`/`+R` (XTGETTCAP) — are therefore left through. The one
+//! approximation is the CSI `n` final: the proxy answers part of the DSR `?`
+//! family and passes the rest, and the reply shapes overlap, so every `n` is
+//! stripped. The reference client (SwiftTerm) does not answer the passed-through
+//! DSR queries, so nothing is lost with it today.
+//!
+//! **Known cost: replayed queries are re-answered.** A query the proxy passes
+//! through is also stored in the session's replay ring, so a client attaching
+//! with replay sees it again and answers it again. Because the filter now lets
+//! those answers through, the child receives that stale reply as input on each
+//! such attach — after the app that asked may have exited, where a shell or an
+//! Ink-based CLI reads it as typed bytes. CPR has always worked this way. The
+//! real fix is to keep passed-through queries out of the ring copy while still
+//! forwarding them live; until then, losing the only answer (the alternative)
+//! is the worse failure.
 //!
 //! **Chunk-scoped by design.** The filter holds no cross-call state: an escape
 //! sequence split across two WebSocket frames passes through unfiltered. The
@@ -180,24 +199,20 @@ fn classify_osc(s: &[u8]) -> Option<usize> {
     }
 }
 
-/// DCS report shapes: tertiary DA (`DCS ! | ...`), macro checksum reports
-/// (`DCS <id> ! ~ <hex>`), DECRQSS answers (`DCS 0$r` / `DCS 1$r`) and
-/// XTGETTCAP answers (`DCS 0+r` / `DCS 1+r`). XTVERSION (`DCS > | ...`) is
-/// deliberately left through so the client's version report reaches the child.
-/// Other DCS payloads are passed through rather than assumed to be replies.
+/// DCS report shapes: only the macro checksum report (`DCS <id> ! ~ <hex>`),
+/// the one DCS reply CapabilityProxy emits. XTVERSION (`DCS > | ...`),
+/// tertiary DA (`DCS ! | ...`), DECRQSS (`DCS 0$r` / `DCS 1$r`) and XTGETTCAP
+/// (`DCS 0+r` / `DCS 1+r`) answers are left through: the proxy passes those
+/// queries to the client, so the client's answer is the only one the child
+/// gets. Other DCS payloads are passed through rather than assumed to be
+/// replies.
 fn classify_dcs(s: &[u8]) -> Option<usize> {
     let (payload, len) = string_sequence(s, 2)?;
     let mut j = 0;
     while j < payload.len() && payload[j].is_ascii_digit() {
         j += 1;
     }
-    let rest = &payload[j..];
-    if rest.starts_with(b"!|")
-        || rest.starts_with(b"!~")
-        || rest.starts_with(b"$r")
-        || rest.starts_with(b"+r")
-        || rest.starts_with(b"+R")
-    {
+    if payload[j..].starts_with(b"!~") {
         Some(len)
     } else {
         None
@@ -271,13 +286,19 @@ mod tests {
     }
 
     #[test]
-    fn strips_tertiary_da_and_decrqss_dcs() {
-        assert!(filtered(b"\x1bP!|7E565445\x1b\\").is_empty());
-        assert!(filtered(b"\x1bP1$r0;1m\x1b\\").is_empty(), "DECRQSS answer");
-        assert!(
-            filtered(b"\x1bP1+r544e=787465726d\x07").is_empty(),
-            "XTGETTCAP"
-        );
+    fn passes_unproxied_dcs_replies_for_the_child_to_receive() {
+        // The proxy passes tertiary DA, DECRQSS and XTGETTCAP queries to the
+        // client, so the client's answer is the only one the child gets.
+        for reply in [
+            &b"\x1bP!|7E565445\x1b\\"[..],    // tertiary DA
+            b"\x1bP1$r0;1m\x1b\\",            // DECRQSS answer
+            b"\x1bP0$r\x1b\\",                // DECRQSS, invalid request
+            b"\x1bP1+r544e=787465726d\x07",   // XTGETTCAP answer
+            b"\x1bP0+r544e\x1b\\",            // XTGETTCAP, unknown cap
+            b"\x1bP1+R544e=787465726d\x1b\\", // XTGETTCAP, upper-case final
+        ] {
+            assert_eq!(filtered(reply), reply, "{reply:?}");
+        }
     }
 
     #[test]
