@@ -37,6 +37,14 @@ are documented anywhere obvious:
 Replace `SUFFIX` in the secret ARN with the real one, and point the image at your
 own registry.
 
+## Colocated with classic openab — `k8s/pod-with-openab.yaml`, `ecs/kiro-with-pty.yaml`
+
+The terminal plus an `openab run` Discord bot over the same `/workspace`, both
+from the openab-pty image. Verified on k3s, including a Discord round trip; the
+ECS form is structurally tested only. Architecture, what was measured, and the
+trust model — which differs from the terminal-only shapes above — are in
+[`../docs/colocated-openab.md`](../docs/colocated-openab.md).
+
 ## CI-built images (GHCR, public)
 
 `.github/workflows/image.yml` builds this Dockerfile on every push to `main` and

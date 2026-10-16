@@ -226,3 +226,37 @@ def test_ecs_broker_script():
     assert c["env"]["OPENAB_AGENT_SOCKET"].startswith("/tmp/")
     script = broker_script(c["entryPoint"] + c["command"])
     check_broker_script(script, c["env"]["OPENAB_CONFIG_TOML"])
+
+
+# --------------------------------------------------------------------- doc
+
+DOC = ROOT / "docs" / "colocated-openab.md"
+
+
+def doc_yaml_pods() -> list[dict]:
+    blocks = re.findall(r"```yaml\n(.*?)```", DOC.read_text(encoding="utf-8"), re.DOTALL)
+    return [d for b in blocks for d in yaml.safe_load_all(b) if isinstance(d, dict) and d.get("kind") == "Pod"]
+
+
+def test_doc_links_resolve():
+    text = DOC.read_text(encoding="utf-8")
+    for target in re.findall(r"\]\((\.\./[^)#]+)\)", text):
+        assert (DOC.parent / target).resolve().exists(), f"dead link {target}"
+
+
+def test_doc_variant_b_follows_the_real_terminal_label():
+    pods = doc_yaml_pods()
+    assert len(pods) == 1, "the doc carries exactly one Pod sketch (variant B)"
+    broker = pods[0]
+    terms = broker["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    terminal = load(K8S_TERMINAL)
+    # A selector that matches nothing leaves the broker unschedulable.
+    assert {t["labelSelector"]["matchLabels"]["app"] for t in terms} == {terminal["metadata"]["labels"]["app"]}
+    # The broker follows the terminal, never the reverse (mutual required affinity deadlocks).
+    assert "affinity" not in terminal["spec"]
+    assert broker["spec"]["restartPolicy"] in ("OnFailure", "Always")
+    c = broker["spec"]["containers"][0]
+    assert c["image"] == k8s_containers(load(K8S_TERMINAL))["openab-pty"]["image"]
+    assert c["securityContext"]["readOnlyRootFilesystem"] is True
+    ws = [v for v in broker["spec"]["volumes"] if v["name"] == "workspace"][0]
+    assert "persistentVolumeClaim" in ws
