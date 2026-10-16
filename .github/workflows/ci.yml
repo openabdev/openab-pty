@@ -61,3 +61,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: jq --version
       - run: bash deploy/hooks/test-startup-hook.sh
+
+  # Structural checks on the shipped colocated manifests (#62): one image,
+  # secrets with one home, only /workspace shared, same hardening everywhere.
+  manifests:
+    name: deploy manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # A venv because ubuntu-24.04's system Python is externally managed (PEP 668).
+      - run: python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" install -r tests/requirements.txt
+      - run: '"$RUNNER_TEMP/venv/bin/python" -m pytest -q tests/'

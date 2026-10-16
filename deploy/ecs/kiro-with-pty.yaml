@@ -14,18 +14,24 @@ metadata:
 #
 # Four containers, and the ordering matters:
 #
-#   init-perms  root, chowns the shared volumes, exits         (essential: false)
-#   tailscale   joins the tailnet, proxies to loopback          (essential: true)
-#   openab      the agent: kiro-cli under the OAB broker        (essential: true)
-#   openab-pty  terminal into the same /workspace               (essential: true)
+#   init-perms  root, chowns the volumes, exits                   (essential: false)
+#   tailscale   joins the tailnet, proxies to loopback             (essential: true)
+#   openab      Discord bot: kiro-cli under the OAB broker         (essential: false)
+#   openab-pty  terminal into the same /workspace                  (essential: true)
 #
-# Both openab and openab-pty mount `workspace`, which is the whole point --
-# and also the trust boundary to understand before deploying this: /workspace is
-# shared, so a terminal session can read and write anything the agent can, and
-# vice versa. One trust zone, by design. Do not put a session here that you would
-# not give the agent's filesystem access to.
+# `openab` is not essential on purpose: a bad or reset Discord token makes
+# `openab run` exit 1, and that must not stop the task and its terminal. ECS
+# does not restart a non-essential container, so the container restarts the
+# broker itself with a backoff loop; switch to a container `restartPolicy` once
+# ecsctl supports it (oablab/ecsctl#60).
 #
-# Replace: subnets, securityGroups, role ARNs, secret ARNs, the Discord channel,
+# Both openab and openab-pty mount `workspace` -- and nothing else in common;
+# each has its own /tmp. /workspace is the trust boundary to understand before
+# deploying this: a terminal session can read and write anything the agent can,
+# including config the agent's kiro-cli will execute, and vice versa. One trust
+# zone, by design. See docs/colocated-openab.md.
+#
+# Replace: subnets, securityGroups, role ARN, secret ARNs, the Discord channel,
 # and the tailscale hostname.
 spec:
   # 2 vCPU / 4 GB: the agent and the terminal both run real workloads here, and
@@ -43,27 +49,30 @@ spec:
   assignPublicIp: true
 
   executionRoleArn: "arn:aws:iam::123456789012:role/openab-pty-test-execution-role"
-  # The agent needs its own permissions (S3 state, Secrets Manager, whatever the
-  # bot does). openab-pty itself needs none -- it holds no AWS credentials, which
-  # is deliberate: a terminal session inheriting the task role would hand every
-  # session the agent's cloud permissions.
-  taskRoleArn: "arn:aws:iam::123456789012:role/openab-ecs-task-role"
+  # No taskRoleArn. A task role is task-wide: Fargate injects the credentials
+  # URI into every container, and the trust note in docs/colocated-openab.md
+  # explains how a session shell gets at what the bot's process can reach. A
+  # Discord bot configured from env needs no AWS permissions at all (secrets are
+  # resolved by the execution role at launch). If you add one -- an s3:// config,
+  # S3 state -- treat every terminal session as holding it, and scope it to that.
 
   volumes:
     - name: workspace
-    - name: tmp
+    - name: pty-tmp
+    - name: oab-tmp
 
   containers:
     - name: init-perms
-      image: ghcr.io/openabdev/openab:pre-beta-kiro
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       essential: false
       user: "0"
       entryPoint: ["/bin/sh", "-c"]
       command:
-        - "chown 1000:1000 /workspace /tmp && chmod 700 /workspace && echo 'volumes chowned to uid 1000'"
+        - "chown 1000:1000 /workspace /pty-tmp /oab-tmp && chmod 700 /workspace /pty-tmp /oab-tmp && echo 'volumes chowned to uid 1000'"
       mountPoints:
         /workspace: workspace
-        /tmp: tmp
+        /pty-tmp: pty-tmp
+        /oab-tmp: oab-tmp
       logGroup: /ecs/kiro-with-pty
 
     - name: tailscale
@@ -77,30 +86,73 @@ spec:
         TS_AUTHKEY: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:TS_AUTHKEY::"
       logGroup: /ecs/kiro-with-pty
 
-    # The agent. Same image, same uid, same HOME as the terminal below -- that
-    # sameness is what makes the terminal useful rather than a separate box that
-    # happens to be nearby.
+    # The agent. Runs from the openab-pty image with the entrypoint overridden,
+    # so it has the same openab, the same kiro-cli, the same uid and HOME as the
+    # terminal below -- one pull, no version skew. Hardened to the same level:
+    # `openab run` needs nothing writable outside /workspace and its own /tmp
+    # (verified, openab 0.10.0). It opens no listener: no [mcp] section and
+    # OPENAB_ACP_ENABLED unset, because the tailscale sidecar forwards inbound
+    # tailnet TCP to every loopback port in the task.
     - name: openab
-      image: ghcr.io/openabdev/openab:pre-beta-kiro
-      essential: true
+      image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
+      essential: false
       user: "1000"
+      readonlyRootFilesystem: true
+      linuxParameters:
+        capabilitiesDrop: ["ALL"]
       dependsOn:
         - containerName: init-perms
           condition: SUCCESS
+      entryPoint: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-c"]
+      command:
+        - |
+          # ${DISCORD_BOT_TOKEN} inside the config stays literal here; openab expands it.
+          # umask in a subshell only: kiro-cli inherits this shell's umask.
+          (umask 077; printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml) || exit 1
+          # The bot's own kiro agent; includeMcpJson=false keeps the terminal's
+          # `computer` server (shared ~/.kiro/settings/mcp.json) out of bot
+          # sessions, where it can only answer 401. See pod-with-openab.yaml.
+          mkdir -p "$HOME/.kiro/agents" || exit 1
+          printf '%s\n' '{"name":"openab-bot","description":"Colocated openab broker agent (openab-pty#62)","tools":["*"],"allowedTools":["*"],"includeMcpJson":false}' > "$HOME/.kiro/agents/openab-bot.json" || exit 1
+          # Restart with backoff until ecsctl can express a container restartPolicy (oablab/ecsctl#60).
+          n=0
+          while :; do
+            openab run -c /tmp/openab.toml
+            rc=$?
+            n=$((n + 1))
+            delay=$((n < 6 ? n * 5 : 30))
+            echo "openab exited rc=$rc (attempt $n); restarting in ${delay}s" >&2
+            sleep "$delay"
+          done
       env:
         HOME: /workspace
         RUST_LOG: info
-        OPENAB_BACKEND_AGENT: kiro
-        OPENAB_AGENT_NAME: kiro-with-pty
+        # Out of /workspace, so a session shell cannot reach the control socket.
+        OPENAB_AGENT_SOCKET: /tmp/openab-run/agent.sock
+        # Non-secret: the token is referenced as ${DISCORD_BOT_TOKEN}, not embedded.
+        OPENAB_CONFIG_TOML: |
+          [discord]
+          bot_token = "${DISCORD_BOT_TOKEN}"
+          allowed_channels = ["REPLACE_WITH_CHANNEL_ID"]
+
+          [agent]
+          command = "kiro-cli"
+          args = ["acp", "--trust-all-tools", "--agent", "openab-bot"]
+          working_dir = "/workspace"
+
+          [pool]
+          max_sessions = 2
+          session_ttl_hours = 24
+      # The only platform secret, on this container alone -- never as a
+      # PTY_FORWARD_* on openab-pty, which would put it in every session.
       secrets:
-        DISCORD_BOT_TOKEN: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab/b0-XXXXXX:DISCORD_BOT_TOKEN::"
+        DISCORD_BOT_TOKEN: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab/kiro-with-pty-XXXXXX:DISCORD_BOT_TOKEN::"
       mountPoints:
         /workspace: workspace
-        /tmp: tmp
+        /tmp: oab-tmp
       logGroup: /ecs/kiro-with-pty
 
-    # The terminal. Hardened harder than the agent, because it takes input from
-    # a human over the network: read-only root filesystem, no capabilities.
+    # The terminal: read-only root filesystem, no capabilities.
     - name: openab-pty
       image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       essential: true
@@ -122,5 +174,5 @@ spec:
         PTY_ADMIN_HASH: "arn:aws:secretsmanager:us-east-1:123456789012:secret:openab-pty/fargate-AbCdEf:PTY_ADMIN_HASH::"
       mountPoints:
         /workspace: workspace
-        /tmp: tmp
+        /tmp: pty-tmp
       logGroup: /ecs/kiro-with-pty
