@@ -199,11 +199,12 @@ logs) plus `secretsmanager:GetSecretValue` on the secret above.
 
 **Do not give openab-pty a task role.** It holds no AWS credentials by design —
 a terminal session inheriting the task role would hand every session the
-deployment's cloud permissions. In `kiro-with-pty.yaml` the task role exists for
-the *agent*, and this is a real consequence of ECS's model to understand: a task
-role is task-wide, so the pty container in that manifest can reach the ECS
-credential endpoint too. If that matters for your deployment, run the terminal in
-its own task and share the workspace over EFS instead.
+deployment's cloud permissions. A task role is task-wide, so this holds for a
+colocated task too: `kiro-with-pty.yaml` carries no task role, because its
+Discord bot needs none. If you add one for the agent, every terminal session can
+reach it; see [the colocated trust model](colocated-openab.md#the-ecs-task-role).
+If that matters, run the terminal in its own task and share the workspace over
+EFS instead.
 
 ---
 
