@@ -132,10 +132,11 @@ spec:
       args:
         - |
           set -eu
-          umask 077
           # The config arrives as a non-secret env var; ${DISCORD_BOT_TOKEN}
           # inside it stays literal here and is expanded by openab itself.
-          printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml
+          # umask in a subshell only: kiro-cli inherits this shell's umask,
+          # and 077 there would make every file the bot creates 0600.
+          (umask 077; printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml)
           # The bot's own kiro agent. `includeMcpJson: false` keeps the shared
           # ~/.kiro/settings/mcp.json out of the bot's sessions: that file
           # carries the terminal's `computer` server, whose Bearer token exists

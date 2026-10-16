@@ -106,9 +106,9 @@ spec:
       entryPoint: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-c"]
       command:
         - |
-          umask 077
           # ${DISCORD_BOT_TOKEN} inside the config stays literal here; openab expands it.
-          printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml || exit 1
+          # umask in a subshell only: kiro-cli inherits this shell's umask.
+          (umask 077; printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml) || exit 1
           # The bot's own kiro agent; includeMcpJson=false keeps the terminal's
           # `computer` server (shared ~/.kiro/settings/mcp.json) out of bot
           # sessions, where it can only answer 401. See pod-with-openab.yaml.

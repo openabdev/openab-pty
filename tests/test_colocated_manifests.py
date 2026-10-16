@@ -73,7 +73,10 @@ def toml_agent_args(config: str) -> list[str]:
 
 def check_broker_script(script: str, config: str) -> None:
     # Config is rendered from env into the broker's own /tmp and run from there.
-    assert '"$OPENAB_CONFIG_TOML" > /tmp/openab.toml' in script
+    assert '(umask 077; printf \'%s\\n\' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml)' in script
+    # A bare umask would be inherited by kiro-cli: every file the bot writes
+    # into the shared /workspace would come out 0600 (measured on p1).
+    assert not re.search(r"^\s*umask\b", script, re.MULTILINE), "umask must be scoped to the config write"
     assert re.search(r"\bopenab run -c /tmp/openab\.toml\b", script)
     # The token stays a reference in the non-secret config.
     assert 'bot_token = "${DISCORD_BOT_TOKEN}"' in config
