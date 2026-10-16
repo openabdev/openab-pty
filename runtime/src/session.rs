@@ -2213,6 +2213,20 @@ mod tests {
             .collect()
     }
 
+    /// Wait until `done` holds, polling: the PTY reader is a separate thread,
+    /// so a fixed sleep races it on a loaded runner (#62's CI hit this on
+    /// macos-14 with 50 ms). Bounded, so a real regression still fails.
+    async fn settle(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition not reached within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     // ---- environment ----------------------------------------------------
 
     #[test]
@@ -2680,7 +2694,7 @@ mod tests {
 
         spawner.emit(b"hello ");
         spawner.emit(b"world");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| manager.get(&name("io")).unwrap().total_written() == 11).await;
 
         let items = drain(&attached.outbound);
         assert_eq!(collected_bytes(&items), b"hello world");
@@ -2704,7 +2718,7 @@ mod tests {
             .unwrap();
 
         attached.write_input(b"ls\x1b[?62;22c -la\r").unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| !spawner.written.lock().is_empty()).await;
         assert_eq!(spawner.written.lock().as_slice(), b"ls -la\r");
     }
 
@@ -2730,7 +2744,7 @@ mod tests {
 
         let replies = b"\x1b[?0u\x1b[?65;4;1;2;6;21;22;17;28c\x1b[24;80R";
         attached.write_input(replies).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| spawner.written.lock().len() >= replies.len()).await;
         assert_eq!(spawner.written.lock().as_slice(), replies);
     }
 
@@ -2751,7 +2765,7 @@ mod tests {
             .unwrap();
 
         spawner.emit(b"prompt\x1b[cdone");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| manager.get(&name("cap")).unwrap().total_written() == 10).await;
 
         assert_eq!(
             spawner.written.lock().as_slice(),
@@ -2768,7 +2782,7 @@ mod tests {
     async fn kitty_answer(spawner: &FakeSpawner) -> Vec<u8> {
         spawner.written.lock().clear();
         spawner.emit(b"\x1b[?u");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| !spawner.written.lock().is_empty()).await;
         spawner.written.lock().clone()
     }
 
@@ -2831,7 +2845,7 @@ mod tests {
         let _created = manager.create(name("solo"), WindowSize::default()).unwrap();
 
         spawner.emit(b"\x1b[c");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| !spawner.written.lock().is_empty()).await;
 
         assert_eq!(
             spawner.written.lock().as_slice(),
@@ -2928,7 +2942,7 @@ mod tests {
             .create(name("cursor"), WindowSize::default())
             .unwrap();
         spawner.emit(b"abcdef");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        settle(|| manager.get(&name("cursor")).unwrap().total_written() == 6).await;
 
         // The cursor is honoured inside the attach lock, which is what makes the
         // replay-to-live handoff atomic; there is deliberately no separate
