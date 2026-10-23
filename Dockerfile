@@ -63,11 +63,11 @@ RUN touch src/main.rs src/lib.rs \
 #
 # A digest, not the tag, for the same reason AGENTS.md pins the Rust builder in
 # Dockerfile.unified: a rolling tag lets a base change alter an unchanged
-# commit's output, with nothing in the build log to say so. Staying current with
-# pre-beta-kiro is still wanted, so it happens on a schedule that opens a PR
-# instead of a build that silently re-resolves — see
-# .github/workflows/bump-base-image.yml. Update OPENAB_BASE_DIGEST's default
-# above by hand with:
+# commit's output, with nothing in the build log to say so. This default only
+# applies to local `docker build .`. CI (.github/workflows/image.yml) resolves
+# the variant's base digest at build time, records it in the job log and in the
+# dev.openab.pty.base-digest label, and a daily scheduled run rebuilds a variant
+# when that digest moves. Update this default by hand when needed with:
 #   T=$(curl -s "https://ghcr.io/token?scope=repository:openabdev/openab:pull&service=ghcr.io" | jq -r .token)
 #   curl -s -H "Authorization: Bearer $T" \
 #     -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \

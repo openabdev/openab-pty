@@ -58,6 +58,7 @@ more stability than what it was built from:
 | Trigger | openab-pty tag | Built FROM |
 |---|---|---|
 | push to `main` | `pre-beta-<variant>` | `openab:pre-beta-<variant>` |
+| daily schedule, only when the base digest moved | `pre-beta-<variant>` | `openab:pre-beta-<variant>` |
 | `v*` tag | `beta-<variant>` | `openab:beta-<variant>` |
 
 Every build also gets an immutable `<variant>-<sha>`. Deploying only the moving
@@ -74,7 +75,12 @@ for what the images contain and under whose terms.
 
 The base image is pinned by digest, resolved per variant at build time and recorded
 in the job log, so a base change cannot silently alter the output of an unchanged
-commit. A scheduled workflow (`bump-base-image.yml`) re-resolves the tracked tag
-weekly and opens a PR if it moved,
-so staying current is a reviewed decision rather than a build silently
-re-resolving a tag on every run.
+commit without a trace. Each image also carries the digest it was built from in
+the `dev.openab.pty.base-digest` label. A daily scheduled run of `image.yml`
+compares that label with the current `openab:pre-beta-<variant>` digest and
+rebuilds only the variants whose base moved. A base-only change, such as a
+Node.js security rebuild of openab, then reaches `pre-beta-<variant>` within a
+day without waiting for a push to `main`. The rebuild goes through the same
+smoke test before it is pushed, and its immutable tag is
+`<variant>-<sha>-base-<digest12>`, so the existing `<variant>-<sha>` tag is never
+overwritten.
