@@ -107,7 +107,7 @@ spec:
           value: 12h
         - name: PTY_IDLE_TTL
           value: 8h
-        # Reverse-attached tools (instance-mcp on a Mac dials in and lends its
+        # Reverse-attached tools (OpenAB Computer on a Mac dials in and lends its
         # tools to one session). Loopback only; the sidecar forwards inbound
         # tailnet TCP to any loopback port, so no `serve` config is needed for
         # GET /tools/attach/{session}. Leave unset to keep the plane off.

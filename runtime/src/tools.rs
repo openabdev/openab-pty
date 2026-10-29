@@ -2,7 +2,7 @@
 //! session by **dialling in**, and the coding CLI inside that session reaches
 //! them over a plain loopback MCP endpoint.
 //!
-//! Design of record: `docs/adr/reverse-attach.md` in `openabdev/instance-mcp`;
+//! Design of record: `docs/adr/reverse-attach.md` in `openabdev/openab-computer`;
 //! runtime issue openabdev/openab-pty#37. The shape, and why each half is where
 //! it is:
 //!

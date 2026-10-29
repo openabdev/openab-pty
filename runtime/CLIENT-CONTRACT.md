@@ -283,7 +283,7 @@ a takeover.
 This section is for a **different client**: not the terminal, but the machine
 whose tools a coding CLI inside a session should be able to call — in practice
 `oab-instance-mcp` on a Mac. Design of record:
-[reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md).
+[reverse attach](https://github.com/openabdev/openab-computer/blob/main/docs/adr/reverse-attach.md).
 The rule that shaped it: **the pod initiates nothing.** The Mac dials in, the pod
 stores only a hash, and the CLI talks to a loopback URL with no credential in it.
 
