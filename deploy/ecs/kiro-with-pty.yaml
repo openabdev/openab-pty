@@ -110,8 +110,10 @@ spec:
           # umask in a subshell only: kiro-cli inherits this shell's umask.
           (umask 077; printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml) || exit 1
           # The bot's own kiro agent; includeMcpJson=false keeps the terminal's
-          # `computer` server (shared ~/.kiro/settings/mcp.json) out of bot
-          # sessions, where it can only answer 401. See pod-with-openab.yaml.
+          # `computer` server out of bot sessions on images built before #76,
+          # which put it in the shared ~/.kiro/settings/mcp.json, where it can
+          # only answer 401. Removable once the images carry the #76 hook. See
+          # pod-with-openab.yaml.
           mkdir -p "$HOME/.kiro/agents" || exit 1
           printf '%s\n' '{"name":"openab-bot","description":"Colocated openab broker agent (openab-pty#62)","tools":["*"],"allowedTools":["*"],"includeMcpJson":false}' > "$HOME/.kiro/agents/openab-bot.json" || exit 1
           # Restart with backoff until ecsctl can express a container restartPolicy (oablab/ecsctl#60).

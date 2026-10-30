@@ -47,7 +47,7 @@ flowchart LR
     oab --> acp
     shell <--> ws
     acp <--> ws
-    pty -. "startup hook writes<br/>mcpServers.computer" .-> ws
+    pty -. "startup hook writes agent openab-terminal<br/>(mcpServers.computer), sets it default" .-> ws
   end
 
   client <-->|WireGuard / tailnet| ts
@@ -85,8 +85,10 @@ real test bot:
   readable from the `openab-pty` container.
 - **A rejected token exits 1.** The bot needs a restart path, described under
   [restarts](#restarts).
-- **The tools plane collides with the bot unless the bot uses its own agent.**
-  See [the tools plane](#the-tools-plane-and-the-bot).
+- **The tools plane collided with the bot unless the bot used its own agent.**
+  That was with the `computer` server in the shared `mcp.json`; since #76 the
+  hook keeps it in a terminal-only agent. See
+  [the tools plane](#the-tools-plane-and-the-bot).
 
 The ECS manifest was checked structurally and has not been deployed. The
 tailscale container is unchanged from `pod-tailscale.yaml`.
@@ -146,28 +148,86 @@ The rules that keep secrets in the right place:
 
 ## The tools plane and the bot
 
-When `PTY_TOOLS_LISTEN` is set, the openab-pty startup hook writes
-`mcpServers.computer` (`http://127.0.0.1:8091/mcp`, `Bearer
-${OPENAB_TOOLS_MCP_TOKEN}`) into `~/.kiro/settings/mcp.json`. HOME is shared,
-so the bot's kiro-cli reads that file too. The bearer token exists only in a PTY
-session's environment, so the bot's requests get a 401. The measured result
-was two `server_init_failure` notifications on every bot session.
+When `PTY_TOOLS_LISTEN` is set, the openab-pty startup hook writes the
+`computer` server (`http://127.0.0.1:8091/mcp`, `Bearer
+${OPENAB_TOOLS_MCP_TOKEN}`) into a terminal-only kiro agent,
+`~/.kiro/agents/openab-terminal.json`, and makes that agent kiro's default. The
+bearer token exists only in a PTY session's environment. A bot started with
+`kiro-cli acp --agent <its own agent>` never loads `openab-terminal`, so it
+never dials `computer`.
 
-The hook cannot avoid this on its side. The runtime clears its environment
-before running it, so it cannot tell that a broker is present, and skipping the
-entry would take the tools away from the terminal. The broker opts out instead:
-its script writes `~/.kiro/agents/openab-bot.json` with `"includeMcpJson":
-false` and runs `kiro-cli acp --agent openab-bot`.
+Before #76 the hook wrote the server into `~/.kiro/settings/mcp.json`. HOME is
+shared, so the bot's kiro-cli read that file too and got a 401: two
+`server_init_failure` notifications on every bot session (measured, kiro-cli
+2.13.0). On upgrade the hook removes that entry from `mcp.json`. It matches it
+by name and exact shape (`url` of the form `http://<listen>/mcp`, the header
+above, and no other keys), so a `computer` entry you wrote or edited yourself
+is left alone, as is every other server and setting in the file.
 
-| Bot's kiro agent | `server_init_failure` per session |
+What the hook writes, and what it leaves alone:
+
+- **`~/.kiro/agents/openab-terminal.json`**: `tools: ["*"]`,
+  `includeMcpJson: true` (so your `mcp.json` servers still load in the
+  terminal), the resources `kiro_default` loads (`AGENTS.md`, `README.md`,
+  skills), `mcpServers.computer` and `allowedTools: ["@computer/*"]`. Keys you
+  add to the file are kept on every boot, `includeMcpJson: false` included. A
+  file with a different `name`, or with a `computer` entry the hook did not
+  write, is left alone with a warning.
+- **`chat.defaultAgent` in `~/.kiro/settings/cli.json`**, the key
+  `kiro-cli agent set-default` writes, but only when it is absent or empty.
+- **Other agent files are no longer touched.** Earlier versions appended
+  `@computer/*` to `allowedTools` in every agent file. That trust stays,
+  because it cannot be told apart from trust you added by hand. It grants
+  nothing unless the agent also has a `computer` server.
+- **Symlinks out of `~/.kiro` are never followed.** A `mcp.json` that links into
+  your dotfiles keeps any old `computer` entry, with a warning; remove it by
+  hand.
+
+### The default-agent side effect
+
+- `kiro-cli chat` in a terminal session starts `openab-terminal` instead of the
+  built-in `kiro_default`. The agent copies `kiro_default`'s resources but not
+  its built-in prompt or its permission rules (`kiro_default` allows reads under
+  the working directory without asking). To start from `kiro_default` instead,
+  delete `openab-terminal.json`, run `kiro-cli agent create openab-terminal
+  --from kiro_default`, and restart: the hook adds `computer` and its trust to
+  that file on the next boot.
+- The setting is per HOME, not per session. Every `kiro-cli chat`, and every
+  `kiro-cli acp` without `--agent`, under `/workspace` starts `openab-terminal`.
+- **A default you chose is kept.** If `chat.defaultAgent` is already set to
+  anything, `kiro_default` included, the hook leaves it, prints one notice line
+  per boot, and `computer` is then available only through `kiro-cli chat --agent
+  openab-terminal`. So `kiro-cli agent set-default kiro_default` reverts the
+  side effect and stays reverted.
+
+### The bot must pass `--agent`
+
+The fix relies on the bot naming its agent. Measured with a terminal-only agent
+as the default; the first row with kiro-cli 2.35.2 and 2.36.0, the other two
+with 2.35.2:
+
+| How kiro-cli starts | MCP servers it attempts |
 |---|---|
-| default agent | 2 |
-| custom agent, `includeMcpJson: true` | 2 |
-| custom agent, field absent | 0 |
-| custom agent, `includeMcpJson: false` | 0 |
+| `kiro-cli acp --agent openab-bot` | the bot agent's own, plus `mcp.json` if `includeMcpJson` is true; never `computer` |
+| `kiro-cli acp` without `--agent` | the default agent's, so `computer` |
+| `kiro-cli chat --no-interactive --agent X` | the default agent's, whatever `X` is |
 
-The manifests set `false` explicitly, so a change of kiro's default cannot
-bring the failures back. Steering survives the switch: with a codeword in
+So the bot must run `kiro-cli acp --agent <its agent>`. Both manifests do, and
+[`tests/test_colocated_manifests.py`](../tests/test_colocated_manifests.py)
+asserts `--agent` in the bot's `[agent].args`. Do not drive the bot through
+`kiro-cli chat --no-interactive`.
+
+### `includeMcpJson` in the manifests
+
+Both manifests still write `openab-bot.json` with `"includeMcpJson": false`,
+because images built before #76 still put `computer` into `mcp.json`. Once
+every image you run has the new hook, the field can be removed (or set to
+`true`), and the bot then sees your `mcp.json` servers as well. That shape was
+checked with kiro-cli 2.36.0: a bot agent with `includeMcpJson: true`, started
+with `kiro-cli acp --agent`, attempted the user's `mcp.json` server and not
+`computer`.
+
+Steering survives the switch to a custom agent: with a codeword in
 `/workspace/.kiro/steering/`, the default agent and `openab-bot` both answered
 it.
 

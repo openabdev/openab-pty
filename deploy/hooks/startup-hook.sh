@@ -23,8 +23,9 @@
 #
 # Based on the merge rules from openabdev/openab-pty#45 by @Reese-max: existing
 # servers and settings are preserved, files that are not what we expect are
-# left byte-identical, agent files are never created, dangling symlinks are
-# left alone, writes are atomic and keep the file's mode.
+# left byte-identical, the only file created is the hook's own, dangling
+# symlinks are left alone, symlinks out of ~/.kiro are never followed, writes
+# are atomic and keep the file's mode.
 
 # jq filters are single-quoted on purpose; their $vars are jq's, not the shell's.
 # shellcheck disable=SC2016
@@ -32,8 +33,19 @@ set -uo pipefail
 
 SERVER=computer
 TRUST='@computer/*'
+# The terminal-only kiro agent that carries the `computer` server (#76).
+AGENT=openab-terminal
 # Literal on purpose: the CLI expands it per process, from the session's env.
 AUTH_HEADER='Bearer ${OPENAB_TOOLS_MCP_TOKEN}'
+
+# The exact server entry this hook writes (and, before #76, wrote into
+# ~/.kiro/settings/mcp.json): nothing but this url shape and this header. An
+# entry a user has edited no longer matches, and is theirs.
+JQ_OURS='def ours($auth):
+    type == "object" and keys == ["headers", "url"]
+    and .headers == {Authorization: $auth}
+    and (.url | type == "string" and test("^http://[^/]+/mcp$"));
+'
 
 warn() { echo "openab-pty-startup-hook: $*" >&2; }
 info() { echo "openab-pty-startup-hook: $*"; }
@@ -43,56 +55,94 @@ info() { echo "openab-pty-startup-hook: $*"; }
 # with a HOME that has nothing in it.
 jq() { HOME=/nonexistent command jq "$@"; }
 
-# merge_json FILE JQ_FILTER [jq args...]
+# phys PATH: PATH with every symlink in it resolved. A missing tail is kept as
+# written (it cannot hold a symlink). Fails on a dangling symlink.
+phys() {
+    local p=$1 tail=''
+    while [[ ! -e $p && ! -L $p ]]; do
+        tail=/$(basename -- "$p")$tail
+        p=$(dirname -- "$p")
+    done
+    if [[ -L $p ]]; then
+        p=$(realpath -e -- "$p" 2>/dev/null) || return 1
+    elif [[ -d $p ]]; then
+        p=$(cd -P -- "$p" 2>/dev/null && pwd -P) || return 1
+    else
+        local d
+        d=$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd -P) || return 1
+        p=$d/$(basename -- "$p")
+    fi
+    printf '%s\n' "$p$tail"
+}
+
+# merge_json FILE [jq args...] JQ_FILTER
 #
 # Apply FILTER to FILE's JSON object (a missing or blank file is `{}`) and
 # write the result atomically — only if it differs semantically, so a boot
-# never churns the file. The filter may `error("skip: …")` to leave the file
-# untouched. Returns 0 always; prints what it did.
+# never churns the file. FILE must resolve, symlinks included, to a path under
+# $HOME/.kiro; anything else is left alone. The filter may `error("skip: …")`
+# to leave the file untouched with a warning, or `error("notice: …")` to leave
+# it untouched with an informational line. Returns 0 when the file is as the
+# filter wants it (written or already so), 1 when it was left alone.
 merge_json() {
     local path=$1
     shift
-    local real=$path
-    if [[ -L $path ]]; then
-        real=$(realpath -e -- "$path" 2>/dev/null) || {
-            warn "skip $path: symlink target does not exist"
-            return 0
-        }
-    fi
+    local home root real
+    home=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || {
+        warn "skip $path: HOME is not a directory"
+        return 1
+    }
+    root=$home/.kiro
+    real=$(phys "$path") || {
+        warn "skip $path: symlink target does not exist"
+        return 1
+    }
+    case $real in
+        "$root"/*) ;;
+        *)
+            warn "skip $path: resolves outside $HOME/.kiro ($real); not following it"
+            return 1
+            ;;
+    esac
     if [[ -e $real && ! -f $real ]]; then
         warn "skip $real: not a regular file"
-        return 0
+        return 1
     fi
     local input='{}'
     if [[ -e $real ]] && grep -q '[^[:space:]]' -- "$real" 2>/dev/null; then
         # Exactly one JSON value, and an object: `{} {}` is not a config.
         if ! jq -e -s 'length == 1 and (.[0] | type) == "object"' -- "$real" >/dev/null 2>&1; then
             warn "skip $real: not a single JSON object"
-            return 0
+            return 1
         fi
-        input=$(cat -- "$real") || { warn "skip $real: unreadable"; return 0; }
+        input=$(cat -- "$real") || { warn "skip $real: unreadable"; return 1; }
     fi
     local output
     if ! output=$(jq --indent 2 "$@" <<<"$input" 2>&1); then
-        warn "skip $real: ${output#jq: error (at <stdin>:*): }"
-        return 0
+        output=${output#jq: error (at <stdin>:*): }
+        if [[ $output == notice:* ]]; then
+            info "${output#notice: }"
+        else
+            warn "skip $real: $output"
+        fi
+        return 1
     fi
     if [[ $(jq -cS . <<<"$input") == "$(jq -cS . <<<"$output")" ]]; then
         return 0
     fi
     local dir
     dir=$(dirname -- "$real")
-    mkdir -p -- "$dir" || { warn "skip $real: cannot create $dir"; return 0; }
+    mkdir -p -- "$dir" || { warn "skip $real: cannot create $dir"; return 1; }
     local tmp
     tmp=$(mktemp "$dir/.$(basename -- "$real").XXXXXX") || {
         warn "skip $real: cannot create a temp file in $dir"
-        return 0
+        return 1
     }
     # A short write (ENOSPC, EIO) must never be renamed over the real file.
     if ! printf '%s\n' "$output" >"$tmp"; then
         rm -f -- "$tmp"
         warn "skip $real: write failed"
-        return 0
+        return 1
     fi
     if [[ -e $real ]]; then
         chmod --reference="$real" -- "$tmp" 2>/dev/null || true
@@ -104,59 +154,87 @@ merge_json() {
     else
         rm -f -- "$tmp"
         warn "skip $real: rename failed"
+        return 1
     fi
 }
 
 # --- kiro-cli ---------------------------------------------------------------
 #
-# ~/.kiro/settings/mcp.json gets `mcpServers.computer`; every existing
-# ~/.kiro/agents/*.json gets `@computer/*` in `allowedTools`. kiro expands
-# ${VAR} inside `headers` but not inside `url` (verified, #44), which is why the
-# key travels in the header.
+# The `computer` server lives in a terminal-only agent,
+# ~/.kiro/agents/openab-terminal.json (`includeMcpJson: true`, so the user's
+# ~/.kiro/settings/mcp.json servers still load in the terminal), and that agent
+# becomes kiro's default: `chat.defaultAgent` in ~/.kiro/settings/cli.json, the
+# key `kiro-cli agent set-default` writes. A default the user already chose,
+# `kiro_default` included, is left alone with a notice.
+#
+# Nothing goes into ~/.kiro/settings/mcp.json any more (#76): anything else
+# running kiro-cli under this HOME, such as a colocated bot, reads that file,
+# has no session token, and got a 401 on every session. A bot started with
+# `kiro-cli acp --agent <its own agent>` never loads openab-terminal. kiro
+# expands ${VAR} inside `headers` but not inside `url` (verified, #44), which
+# is why the key travels in the header.
 wire_kiro() {
-    local mcp=$HOME/.kiro/settings/mcp.json
+    local agent=$HOME/.kiro/agents/$AGENT.json
     local listen=${OPENAB_PTY_TOOLS_LISTEN:-}
     if [[ -n $listen ]]; then
-        # Replace `computer` only when it is absent, ours (by header), or an old
-        # hand-wired URL on this same listener (/mcp/<session>/<key> — the
-        # rotation-broken form). Anything else is the user's: warn and leave it.
-        merge_json "$mcp" \
-            --arg name "$SERVER" --arg base "http://${listen}/mcp" --arg auth "$AUTH_HEADER" '
-            if has("mcpServers") and (.mcpServers | type) != "object"
-            then error("skip: mcpServers is not an object") else . end
+        # The agent file is the hook's, but a user may add to it: keys it
+        # already has are kept (`includeMcpJson: false` too), and a `computer`
+        # entry that is not ours by header, or a different `name`, means the
+        # file is someone else's: warn and leave it. A new file gets
+        # kiro_default's resources (as of kiro-cli 2.35/2.36), so AGENTS.md,
+        # README.md and skills still load in the terminal.
+        if merge_json "$agent" \
+            --arg agent "$AGENT" --arg name "$SERVER" --arg url "http://${listen}/mcp" \
+            --arg auth "$AUTH_HEADER" --arg trust "$TRUST" \
+            --arg skills "skill://$HOME/.kiro/skills/*/SKILL.md" '
+            def default(k; v): if has(k) then . else .[k] = v end;
+            if has("name") and .name != $agent
+            then error("skip: name is not \($agent); leaving it") else . end
+            | if has("mcpServers") and (.mcpServers | type) != "object"
+              then error("skip: mcpServers is not an object") else . end
+            | if has("allowedTools") and (.allowedTools | type) != "array"
+              then error("skip: allowedTools is not an array") else . end
             | (.mcpServers[$name]) as $cur
-            | if $cur == null
-                 or ((try $cur.headers.Authorization catch null) == $auth)
-                 or ((try $cur.url catch null) | type == "string"
-                     and (. == $base or startswith($base + "/")))
-              then .mcpServers[$name] = {url: $base, headers: {Authorization: $auth}}
-              else error("skip: mcpServers.computer is not ours; leaving it")
-              end'
-
-        local agent
-        for agent in "$HOME"/.kiro/agents/*.json; do
-            [[ -f $agent ]] || continue
-            # Trust is added, never visibility: a restrictive `tools` list and
-            # an agent's own `mcpServers` stay as the user wrote them.
-            merge_json "$agent" --arg trust "$TRUST" '
-                if has("allowedTools") and (.allowedTools | type) != "array"
-                then error("skip: allowedTools is not an array") else . end
-                | if ((.allowedTools // [])
-                      | any(. == $trust or . == "@computer" or . == "*"))
-                  then . else .allowedTools = ((.allowedTools // []) + [$trust]) end'
-        done
-    else
-        # Tools plane off: withdraw only the server entry this hook wrote,
-        # recognised by its header, so a persistent workspace does not keep a
-        # server that can only answer 401. `@computer/*` trust in agent files
-        # is left: it names a server, grants nothing while none is configured,
-        # and may have been the user's own.
-        [[ -e $mcp ]] || return 0
-        merge_json "$mcp" --arg name "$SERVER" --arg auth "$AUTH_HEADER" '
-            if (.mcpServers | type) == "object"
-               and ((try .mcpServers[$name].headers.Authorization catch null) == $auth)
+            | if $cur != null and ((try $cur.headers.Authorization catch null) != $auth)
+              then error("skip: mcpServers.computer is not ours; leaving it") else . end
+            | default("name"; $agent)
+            | default("description";
+                "openab-pty terminal agent: carries the computer MCP server (written by the openab-pty startup hook)")
+            | default("tools"; ["*"])
+            | default("resources"; ["file://AmazonQ.md", "file://AGENTS.md", "file://README.md",
+                                    "skill://.kiro/skills/*/SKILL.md", $skills])
+            | default("includeMcpJson"; true)
+            | .mcpServers[$name] = {url: $url, headers: {Authorization: $auth}}
+            | if ((.allowedTools // []) | any(. == $trust or . == "@computer" or . == "*"))
+              then . else .allowedTools = ((.allowedTools // []) + [$trust]) end'
+        then
+            merge_json "$HOME/.kiro/settings/cli.json" \
+                --arg key chat.defaultAgent --arg agent "$AGENT" '
+                if .[$key] == null or .[$key] == "" then .[$key] = $agent
+                elif .[$key] == $agent then .
+                else error("notice: kiro default agent is \(.[$key] | tojson) (chat.defaultAgent, set by the user); left unchanged, so the computer MCP server needs: kiro-cli chat --agent \($agent)")
+                end'
+        fi
+    elif [[ -e $agent ]]; then
+        # Tools plane off: withdraw only the server entry this hook wrote, so a
+        # persistent workspace does not keep a server that can only answer
+        # 401. The agent, its trust and the default agent stay.
+        merge_json "$agent" --arg name "$SERVER" --arg auth "$AUTH_HEADER" "$JQ_OURS"'
+            if (.mcpServers | type) == "object" and (.mcpServers[$name] | ours($auth))
             then del(.mcpServers[$name]) else . end'
     fi
+
+    # Before #76 the hook wrote `computer` into the shared mcp.json, so remove
+    # that entry, and only that entry: by name and its exact shape. A
+    # hand-wired or edited `computer` is the user's. Either way the hook no
+    # longer touches other agents' `allowedTools`; `@computer/*` it appended to
+    # them earlier is indistinguishable from a user's own, so it stays (it
+    # names a server those agents no longer get from the hook).
+    local mcp=$HOME/.kiro/settings/mcp.json
+    [[ -e $mcp ]] || return 0
+    merge_json "$mcp" --arg name "$SERVER" --arg auth "$AUTH_HEADER" "$JQ_OURS"'
+        if (.mcpServers | type) == "object" and (.mcpServers[$name] | ours($auth))
+        then del(.mcpServers[$name]) else . end'
 }
 
 main() {
