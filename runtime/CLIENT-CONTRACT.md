@@ -456,24 +456,35 @@ actually bound — the same one sessions see in `OPENAB_TOOLS_MCP_ENDPOINT`.
 **What the hook writes today (kiro-cli).** When the tools plane is on and
 `kiro-cli` is on `PATH`:
 
-- `~/.kiro/settings/mcp.json` gets `mcpServers.computer` = the block below.
-  Every other server and setting, and the file's key order and mode, are kept.
-  An existing `computer` entry is replaced only if the hook wrote it, or if it
-  is a hand-wired URL on this same listener (the rotation-broken
-  `/mcp/<session>/<key>` form); any other `computer` entry is the user's and is
-  left alone, with a warning.
-- every existing `~/.kiro/agents/*.json` gets `@computer/*` in `allowedTools`
-  (unless it already has `@computer/*`, `@computer` or `*`). Agent files are
-  never created, and a restrictive `tools` list or an agent's own `mcpServers`
-  is left as the user wrote it — trust is added, visibility is not. An agent
-  with `includeMcpJson: false` therefore does not see the server until its
-  owner adds it.
+- a terminal-only agent, `~/.kiro/agents/openab-terminal.json`, gets
+  `mcpServers.computer` = the block below plus `@computer/*` in `allowedTools`.
+  A new file also gets `tools: ["*"]`, `includeMcpJson: true` (the user's
+  `mcp.json` servers still load) and `kiro_default`'s resources. Keys already in
+  the file are kept; a file with another `name`, or a `computer` entry the hook
+  did not write (recognised by its header), is left alone with a warning.
+- that agent becomes kiro's default: `chat.defaultAgent` in
+  `~/.kiro/settings/cli.json` (the key `kiro-cli agent set-default` writes), but
+  only when the key is absent or empty. A default the user chose, `kiro_default`
+  included, is kept with a one-line notice; `computer` is then reachable with
+  `kiro-cli chat --agent openab-terminal`.
+- `~/.kiro/settings/mcp.json` is no longer written: anything else under the same
+  HOME (a colocated bot) reads it and has no session token (#76). The
+  `computer` entry earlier versions wrote there is removed, matched by name and
+  exact shape (`url` `http://<listen>/mcp`, the header below, nothing else);
+  every other entry, and the file's key order and mode, are kept. Another
+  process sharing HOME stays clear of `computer` only if it starts kiro with an
+  explicit `--agent` (`kiro-cli acp --agent <agent>`); without one it gets the
+  default agent, and `kiro-cli chat --no-interactive` starts the default agent's
+  servers even with `--agent` (measured, kiro-cli 2.35.2).
+- other agent files are not touched. `@computer/*` trust earlier versions
+  appended to them stays, since it cannot be told from a user's own.
 - a file that is not exactly one JSON object, or whose `mcpServers` /
   `allowedTools` has the wrong type, is left byte-identical; a dangling symlink,
-  or a path that is not a regular file, is left alone.
-- with the tools plane off, only the server entry the hook wrote (recognised by
-  its header) is removed again. `@computer/*` trust in agent files stays: it
-  grants nothing while no `computer` server is configured.
+  a symlink that resolves outside `~/.kiro`, or a path that is not a regular
+  file, is left alone.
+- with the tools plane off, only the server entries the hook wrote (exact
+  shape) are removed again, from the agent and from `mcp.json`. The agent, its
+  trust and the default agent stay.
 
 The hook is best-effort: any failure is logged and the runtime serves anyway.
 Other CLIs are not wired yet — the env vars and the manual steps below apply, and

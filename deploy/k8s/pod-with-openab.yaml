@@ -87,9 +87,10 @@ spec:
 
     # --------------------------------------------------------------- openab-pty
     # Unchanged from pod-tailscale.yaml. The tools plane may stay on: its
-    # startup hook writes `mcpServers.computer` into the shared
-    # ~/.kiro/settings/mcp.json, and the bot below runs kiro-cli under its own
-    # agent with `includeMcpJson: false`, so it never dials that server.
+    # startup hook writes `mcpServers.computer` into the terminal-only agent
+    # ~/.kiro/agents/openab-terminal.json (#76) and makes it kiro's default, and
+    # the bot below runs `kiro-cli acp --agent openab-bot`, so it never dials
+    # that server. The bot must keep passing --agent.
     - name: openab-pty
       image: ghcr.io/openabdev/openab-pty:pre-beta-kiro
       imagePullPolicy: IfNotPresent
@@ -138,10 +139,12 @@ spec:
           # and 077 there would make every file the bot creates 0600.
           (umask 077; printf '%s\n' "$OPENAB_CONFIG_TOML" > /tmp/openab.toml)
           # The bot's own kiro agent. `includeMcpJson: false` keeps the shared
-          # ~/.kiro/settings/mcp.json out of the bot's sessions: that file
-          # carries the terminal's `computer` server, whose Bearer token exists
-          # only in a PTY session's environment, so the bot would get a 401 and
-          # a server_init_failure on every session (measured, kiro-cli 2.13.0).
+          # ~/.kiro/settings/mcp.json out of the bot's sessions: images built
+          # before #76 put the terminal's `computer` server there, whose Bearer
+          # token exists only in a PTY session's environment, so the bot would
+          # get a 401 and a server_init_failure on every session (measured,
+          # kiro-cli 2.13.0). Remove it once every image you run has the #76
+          # hook; the bot then also sees the user's mcp.json servers.
           mkdir -p "$HOME/.kiro/agents"
           printf '%s\n' '{"name":"openab-bot","description":"Colocated openab broker agent (openab-pty#62)","tools":["*"],"allowedTools":["*"],"includeMcpJson":false}' \
             > "$HOME/.kiro/agents/openab-bot.json"
