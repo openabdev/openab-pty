@@ -151,7 +151,7 @@ had chosen another default, in which case use `kiro-cli chat --agent
 openab-terminal`. There is no `mcp add` step; the hook's log lines appear in the
 runtime's container log at startup.
 The pod initiates nothing and stores only a hash. Design:
-[reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md);
+[reverse attach](https://github.com/openabdev/openab-computer/blob/main/docs/adr/reverse-attach.md);
 wire contract: §9 of [`../runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
 
 ```bash

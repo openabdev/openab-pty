@@ -71,7 +71,7 @@ scrollback_replay = false
 filter_terminal_responses = ${PTY_FILTER_TERMINAL_RESPONSES}
 admin_credential_hash = "${PTY_ADMIN_HASH}"
 seed_dir = "${PTY_SEED_DIR:-}"
-# Reverse-attached tools (a Mac lends its instance-mcp tools to one session).
+# Reverse-attached tools (a Mac lends its OpenAB Computer tools to one session).
 # Empty disables the plane; the runtime refuses anything but loopback here.
 tools_listen = "${PTY_TOOLS_LISTEN:-}"
 tools_attach_ttl = "${PTY_TOOLS_ATTACH_TTL:-24h}"
