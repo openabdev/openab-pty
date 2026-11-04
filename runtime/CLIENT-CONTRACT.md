@@ -440,9 +440,10 @@ does not edit any CLI's config; whatever installs the CLI does that. Properties:
   or, while nothing is attached,
   `{"attached": false, "grant_pending": bool, "last_detach_reason": …, "last_detach_close_code": …, "last_detach_secs_ago": …, "hint": "…"}`.
   `last_detach_reason` is `null` (never detached) or one of `liveness_timeout`,
-  `closed`, `revoked`, `ttl_expired`, `session_ended`, `runtime_replaced`
-  (during a drain) or `takeover` (reserved; a replaced socket does not record a
-  detach because a newer one is attached). With `grant_pending: true`
+  `closed`, `revoked`, `ttl_expired` or `session_ended`; `runtime_replaced` and
+  `takeover` are reserved and not recorded today (a drain removes every socket
+  before closing it, and a replaced socket does not record a detach because a
+  newer one is attached). With `grant_pending: true`
   the Mac is expected to redial on its own; `hint` tells the agent to wait and
   check again rather than ask the human to lend the Mac again.
 - `tools/call <anything else>` while not attached → a **tool** result with
