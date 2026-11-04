@@ -585,8 +585,8 @@ never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 1. Operator: `POST /admin/sessions/{s}/tools-attach`, hand `secret` to the Mac.
 2. Mac: open `ws(s)://<runtime>/tools/attach/{s}` with `Authorization: Bearer <secret>`.
 3. Mac: answer `initialize`, then serve `tools/list` / `tools/call` as an MCP server.
-4. Mac: on close 1000/4006 redial with backoff while the grant is valid; on any
-   other 4xxx stop.
+4. Mac: on close 1000/4006/4011 redial with backoff while the grant is valid; on
+   any other 4xxx stop.
 5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
 
 The CLI side is zero steps: on a variant the image's startup hook knows (today
