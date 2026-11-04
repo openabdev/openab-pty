@@ -80,8 +80,16 @@ pub const MAX_LOOPBACK_BODY_BYTES: usize = 1024 * 1024;
 /// Largest WS message accepted from the Mac. Screenshot results are base64 PNGs
 /// of a whole display, so this is deliberately generous.
 pub const MAX_MAC_FRAME_BYTES: usize = 16 * 1024 * 1024;
-/// Liveness: the runtime pings the Mac at this interval and closes after
-/// [`MAX_MISSED_PINGS`] intervals with no inbound frame of any kind.
+/// Liveness: the runtime pings the Mac at this interval and closes with
+/// [`close_code::LIVENESS_TIMEOUT`] after [`MAX_MISSED_PINGS`] intervals with no
+/// inbound frame of any kind.
+///
+/// Missed pings are counted even while a request is in flight. A ping is the
+/// only signal that tells a busy Mac from a half-open TCP path, and suspending
+/// it for a call would only stretch a dead socket's lifetime by up to
+/// [`REQUEST_TIMEOUT`], after which the caller gets `-32003` anyway. A client
+/// that keeps a receive outstanding answers pings during any call (the WS layer
+/// does it), so the budget costs a correct client nothing.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const MAX_MISSED_PINGS: u32 = 3;
 /// The MCP protocol revision this runtime speaks to both sides.
@@ -99,6 +107,14 @@ const TO_MAC_QUEUE: usize = 64;
 struct Grant {
     hash: [u8; 32],
     expires_at: Instant,
+}
+
+/// Why a session's Mac last went away, kept so `instance_status` can tell an
+/// agent "the socket dropped, the Mac will redial" from "the lease is gone".
+#[derive(Clone, Copy)]
+struct Detach {
+    code: u16,
+    at: Instant,
 }
 
 /// One-time result of minting. The plaintext is returned to the admin caller and
@@ -281,7 +297,11 @@ pub struct ToolsHub {
     /// when a session's child is spawned, so it exists before the CLI can ask.
     loopback_keys: Mutex<HashMap<SessionName, [u8; 32]>>,
     attached: Mutex<HashMap<SessionName, Arc<Attached>>>,
+    /// Last detach per session. Recorded when the current socket goes away or a
+    /// grant is revoked; forgotten with the session.
+    last_detach: Mutex<HashMap<SessionName, Detach>>,
     max_ttl: Duration,
+    ping_interval: Duration,
     audit: AuditLogger,
 }
 
@@ -293,9 +313,18 @@ impl ToolsHub {
             grants: Mutex::new(HashMap::new()),
             loopback_keys: Mutex::new(HashMap::new()),
             attached: Mutex::new(HashMap::new()),
+            last_detach: Mutex::new(HashMap::new()),
             max_ttl,
+            ping_interval: PING_INTERVAL,
             audit,
         }
+    }
+
+    /// Override the liveness ping interval ([`PING_INTERVAL`] by default). Tests
+    /// use it to observe a liveness close without waiting over a minute.
+    pub fn with_ping_interval(mut self, interval: Duration) -> Self {
+        self.ping_interval = interval.max(Duration::from_millis(1));
+        self
     }
 
     pub fn max_ttl(&self) -> Duration {
@@ -363,7 +392,21 @@ impl ToolsHub {
         if let Some(attached) = &attached {
             attached.close(code);
         }
-        grant.is_some() || attached.is_some()
+        let revoked = grant.is_some() || attached.is_some();
+        if revoked {
+            self.record_detach(session, code);
+        }
+        revoked
+    }
+
+    fn record_detach(&self, session: &SessionName, code: u16) {
+        self.last_detach.lock().insert(
+            session.clone(),
+            Detach {
+                code,
+                at: Instant::now(),
+            },
+        );
     }
 
     /// Constant-time verification of a presented attach secret. Erases the
@@ -458,6 +501,7 @@ impl ToolsHub {
     pub fn forget_session(&self, session: &SessionName) {
         self.loopback_keys.lock().remove(session);
         self.revoke(session, close_code::SESSION_ENDED);
+        self.last_detach.lock().remove(session);
     }
 
     // -- attach ----------------------------------------------------------------
@@ -542,7 +586,7 @@ impl ToolsHub {
             }
         });
 
-        let mut ping = tokio::time::interval(PING_INTERVAL);
+        let mut ping = tokio::time::interval(self.ping_interval);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping.tick().await;
         let mut missed: u32 = 0;
@@ -571,7 +615,12 @@ impl ToolsHub {
                     if attached.is_closed() { break; }
                     missed += 1;
                     if missed > MAX_MISSED_PINGS {
-                        tracing::info!(%session, "tools attach: Mac silent past the ping budget");
+                        tracing::info!(
+                            %session,
+                            code = close_code::LIVENESS_TIMEOUT,
+                            "tools attach: Mac silent past the ping budget"
+                        );
+                        attached.close(close_code::LIVENESS_TIMEOUT);
                         break;
                     }
                     let _ = attached.to_mac.try_send(Message::Ping(Vec::new().into()));
@@ -584,7 +633,10 @@ impl ToolsHub {
 
         // Socket gone (or we decided it is). Normal closure unless a lifecycle
         // code was already chosen; then detach from the hub if still current.
+        // Only the current socket records a detach: a revoke records its own
+        // code, and a socket that lost a takeover leaves a newer one attached.
         attached.close(1000);
+        let code = attached.close_code.load(Ordering::Acquire) as u16;
         {
             let mut map = self.attached.lock();
             if map
@@ -592,10 +644,11 @@ impl ToolsHub {
                 .is_some_and(|current| Arc::ptr_eq(current, &attached))
             {
                 map.remove(&session);
+                drop(map);
+                self.record_detach(&session, code);
             }
         }
         let _ = writer.await;
-        let code = attached.close_code.load(Ordering::Acquire) as u16;
         self.audit.record(
             AuditEvent::new(AuditKind::ToolsDetach)
                 .session_name(&session)
@@ -709,11 +762,7 @@ impl ToolsHub {
         if name == STATUS_TOOL {
             let status = match self.attached_for(session) {
                 Some(attached) => attached.status(self.grant_expiry(session)),
-                None => json!({
-                    "attached": false,
-                    "session": session.as_str(),
-                    "grant_pending": self.grant_expiry(session).is_some(),
-                }),
+                None => self.detached_status(session),
             };
             return json!({
                 "jsonrpc": "2.0",
@@ -729,8 +778,31 @@ impl ToolsHub {
             Some(attached) => forward(&attached, id, request).await,
             // A tool error, not a protocol error: the agent reads the text and
             // can tell the human, instead of its MCP client tearing down.
+            None if self.grant_expiry(session).is_some() => tool_error_result(id, REDIAL_HINT),
             None => tool_error_result(id, CallError::NotAttached.message()),
         }
+    }
+
+    /// `instance_status` while nothing is attached. `grant_pending` alone reads
+    /// like a lost lease; the last detach reason and a hint say whether to wait
+    /// for the Mac's redial or to ask the human.
+    fn detached_status(&self, session: &SessionName) -> Value {
+        let grant_pending = self.grant_expiry(session).is_some();
+        let last = self.last_detach.lock().get(session).copied();
+        let hint = match (grant_pending, last.map(|d| d.code)) {
+            (true, Some(close_code::LIVENESS_TIMEOUT)) => LIVENESS_HINT,
+            (true, _) => REDIAL_HINT,
+            (false, _) => CallError::NotAttached.message(),
+        };
+        json!({
+            "attached": false,
+            "session": session.as_str(),
+            "grant_pending": grant_pending,
+            "last_detach_reason": last.map(|d| detach_reason(d.code)),
+            "last_detach_close_code": last.map(|d| d.code),
+            "last_detach_secs_ago": last.map(|d| d.at.elapsed().as_secs()),
+            "hint": hint,
+        })
     }
 
     // -- maintenance ---------------------------------------------------------
@@ -754,6 +826,7 @@ impl ToolsHub {
         let mut known: Vec<SessionName> = self.grants.lock().keys().cloned().collect();
         known.extend(self.attached.lock().keys().cloned());
         known.extend(self.loopback_keys.lock().keys().cloned());
+        known.extend(self.last_detach.lock().keys().cloned());
         known.sort();
         known.dedup();
         for name in known {
@@ -849,10 +922,29 @@ pub fn close_reason(code: u16) -> &'static str {
         close_code::SESSION_ENDED => "session ended",
         close_code::RUNTIME_REPLACED => "runtime replaced",
         close_code::TOOLS_REVOKED => "tools grant revoked by the admin plane",
+        close_code::LIVENESS_TIMEOUT => "liveness timeout: no frame within the ping budget; redial",
         1000 => "normal closure",
         _ => "closed",
     }
 }
+
+/// Stable token for `instance_status.last_detach_reason`.
+pub fn detach_reason(code: u16) -> &'static str {
+    match code {
+        close_code::LIVENESS_TIMEOUT => "liveness_timeout",
+        close_code::TOOLS_REVOKED => "revoked",
+        close_code::TTL_EXPIRED => "ttl_expired",
+        close_code::TAKEOVER => "takeover",
+        close_code::SESSION_ENDED => "session_ended",
+        close_code::RUNTIME_REPLACED => "runtime_replaced",
+        _ => "closed",
+    }
+}
+
+/// What an agent is told while a grant is valid but no socket is attached.
+const REDIAL_HINT: &str = "No Mac is attached right now, but its grant is still valid: the Mac redials on its own, normally within 30 s. Wait, call instance_status again, then retry; ask the human to lend it again only if it stays detached for several minutes.";
+/// Same, after the runtime closed a Mac that stopped answering pings.
+const LIVENESS_HINT: &str = "Liveness timeout: the Mac stopped answering pings (usually because one tool call blocked it for over a minute) and the runtime closed the socket. The grant is still valid and the Mac redials on its own, normally within 30 s. Wait, call instance_status again, then retry; keep each call short and start long work as a background job (e.g. exec_start) instead of blocking in one call.";
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -1047,5 +1139,48 @@ mod tests {
         assert!(hub.summary().get("a").is_some());
         assert!(hub.summary().get("b").is_none());
         assert!(hub.check_loopback_key(&a, &hub.issue_loopback_key(&a)));
+    }
+
+    #[test]
+    fn detached_status_names_the_last_detach_and_whether_to_wait() {
+        let hub = ToolsHub::new(Duration::from_secs(60), AuditLogger);
+        let s = session("a");
+        let fresh = hub.detached_status(&s);
+        assert_eq!(fresh["grant_pending"], json!(false));
+        assert_eq!(fresh["last_detach_reason"], Value::Null);
+
+        hub.mint(&s).unwrap();
+        hub.record_detach(&s, close_code::LIVENESS_TIMEOUT);
+        let liveness = hub.detached_status(&s);
+        assert_eq!(liveness["grant_pending"], json!(true));
+        assert_eq!(liveness["last_detach_reason"], json!("liveness_timeout"));
+        assert_eq!(liveness["last_detach_close_code"], json!(4011));
+        assert_eq!(liveness["hint"], json!(LIVENESS_HINT));
+
+        hub.record_detach(&s, 1000);
+        assert_eq!(hub.detached_status(&s)["hint"], json!(REDIAL_HINT));
+
+        hub.revoke(&s, close_code::TOOLS_REVOKED);
+        let revoked = hub.detached_status(&s);
+        assert_eq!(revoked["grant_pending"], json!(false));
+        assert_eq!(revoked["last_detach_reason"], json!("revoked"));
+
+        hub.sweep(|_| false);
+        assert_eq!(hub.detached_status(&s)["last_detach_reason"], Value::Null);
+    }
+
+    #[test]
+    fn liveness_has_its_own_close_code_and_reason() {
+        assert_eq!(close_code::LIVENESS_TIMEOUT, 4011);
+        assert_ne!(
+            close_reason(close_code::LIVENESS_TIMEOUT),
+            close_reason(1000)
+        );
+        assert!(close_reason(close_code::LIVENESS_TIMEOUT).len() <= 123);
+        assert_eq!(
+            detach_reason(close_code::LIVENESS_TIMEOUT),
+            "liveness_timeout"
+        );
+        assert_eq!(detach_reason(1000), "closed");
     }
 }
