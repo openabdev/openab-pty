@@ -632,23 +632,37 @@ async fn a_ping_silent_mac_is_closed_with_liveness_timeout_and_may_redial() {
     );
 
     // Replace it with a Mac that never reads, so it never answers a ping.
-    let mut stuck = ws_connect(
+    let stuck = ws_connect(
         &format!("ws://{}/tools/attach/eps", h.addr),
         ("authorization", format!("Bearer {secret}")),
     )
     .await
     .unwrap();
     assert_eq!(healthy.await.unwrap(), close_code::TAKEOVER);
-    // Well past MAX_MISSED_PINGS intervals. Reading would answer the pings.
-    tokio::time::sleep(ping * 15).await;
-    let code = loop {
-        match tokio::time::timeout(IO_TIMEOUT, stuck.next()).await {
-            Ok(Some(Ok(tungstenite::Message::Close(Some(frame))))) => break u16::from(frame.code),
-            Ok(Some(Ok(_))) => continue,
-            other => panic!("expected a close frame, got {other:?}"),
-        }
+    // Read the raw TCP stream: a WS client would queue a pong for every ping it
+    // reads, which is exactly what this Mac must not do. Unmasked server close
+    // frame: 0x88, payload length, then the code big-endian.
+    let mut raw = match stuck.into_inner() {
+        tokio_tungstenite::MaybeTlsStream::Plain(stream) => stream,
+        _ => unreachable!("plain ws:// in tests"),
     };
-    assert_eq!(code, close_code::LIVENESS_TIMEOUT);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(IO_TIMEOUT, raw.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => bytes.extend_from_slice(&chunk[..n]),
+            Err(_) => panic!("the runtime never closed a ping-silent Mac"),
+        }
+    }
+    let [hi, lo] = close_code::LIVENESS_TIMEOUT.to_be_bytes();
+    assert!(
+        bytes
+            .windows(4)
+            .any(|w| w[0] == 0x88 && w[2] == hi && w[3] == lo),
+        "no close frame with code {} on the wire",
+        close_code::LIVENESS_TIMEOUT
+    );
 
     // The agent is told why and what to do, not just grant_pending=true.
     let mut detached = Value::Null;
