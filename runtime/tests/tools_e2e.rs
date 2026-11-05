@@ -726,14 +726,32 @@ async fn a_ping_silent_mac_is_closed_with_liveness_timeout_and_may_redial() {
 #[tokio::test]
 #[ignore = "binds sockets and spawns a PTY child"]
 async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
+    lender_drops_its_socket("zeta", SocketEnd::Fin).await;
+}
+
+/// The same with a forced RST (`SO_LINGER` 0), which is how a killed process's
+/// socket usually reaches the runtime.
+#[tokio::test]
+#[ignore = "binds sockets and spawns a PTY child"]
+async fn a_lender_that_resets_its_socket_is_recorded_as_closed_at_once() {
+    lender_drops_its_socket("theta", SocketEnd::Rst).await;
+}
+
+/// How the lender's TCP stream goes away, below the WS layer.
+enum SocketEnd {
+    Fin,
+    Rst,
+}
+
+async fn lender_drops_its_socket(session: &str, how: SocketEnd) {
     let h = Harness::start(Duration::from_secs(60)).await;
-    let token = h.create("zeta").await;
-    let url = h.shell_tools_url("zeta", &token).await;
-    let secret = h.mint_tools("zeta").await;
+    let token = h.create(session).await;
+    let url = h.shell_tools_url(session, &token).await;
+    let secret = h.mint_tools(session).await;
     let status_call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"instance_status","arguments":{}}});
 
     let lender = ws_connect(
-        &format!("ws://{}/tools/attach/zeta", h.addr),
+        &format!("ws://{}/tools/attach/{session}", h.addr),
         ("authorization", format!("Bearer {secret}")),
     )
     .await
@@ -749,12 +767,15 @@ async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
     }
     assert_eq!(attached, json!(true));
 
-    // Close the TCP stream under the WS layer: FIN, no close frame — what the
-    // runtime sees when the lender's process exits.
+    // Close the TCP stream under the WS layer, with no close frame: what the
+    // runtime sees when the lender's process exits (FIN or RST).
     let raw = match lender.into_inner() {
         tokio_tungstenite::MaybeTlsStream::Plain(stream) => stream,
         _ => unreachable!("plain ws:// in tests"),
     };
+    if let SocketEnd::Rst = how {
+        raw.set_zero_linger().expect("SO_LINGER 0");
+    }
     let dropped = std::time::Instant::now();
     drop(raw);
 
@@ -768,6 +789,11 @@ async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
+        !detached["last_detach_reason"].is_null(),
+        "no detach recorded {:?} after the socket dropped: {detached}",
+        dropped.elapsed()
+    );
+    assert!(
         dropped.elapsed() < openab_pty::tools::PING_INTERVAL / 4,
         "detach took {:?}: a dropped socket must not wait for the ping budget",
         dropped.elapsed()
@@ -779,7 +805,7 @@ async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
     assert!(detached["hint"].as_str().unwrap().contains("redials"));
 
     // The grant survived: the same secret redials and serves calls.
-    let again = fake_mac(h.addr, "zeta", &secret, "again")
+    let again = fake_mac(h.addr, session, &secret, "again")
         .await
         .expect("redial accepted");
     let mut who = String::new();
@@ -795,8 +821,12 @@ async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(who, "fake mac again");
-    h.admin("DELETE", "/admin/sessions/zeta/tools-attach", None)
-        .await;
+    h.admin(
+        "DELETE",
+        &format!("/admin/sessions/{session}/tools-attach"),
+        None,
+    )
+    .await;
     assert_eq!(again.await.unwrap(), close_code::TOOLS_REVOKED);
     h.shutdown().await;
 }

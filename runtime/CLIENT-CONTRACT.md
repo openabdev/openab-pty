@@ -374,13 +374,20 @@ Text frames carry plain MCP JSON-RPC, no envelope:
    other way. `4011` leaves the grant valid, so redial.
    A Mac that is **stopped but alive** (SIGSTOP, a debugger pause, a frozen
    process) gets `4011` too: its kernel keeps ACKing pings, but the process
-   never reads them, so no pong comes back. A Mac whose **process exits**
-   (crash, `SIGKILL`, `SIGHUP`, a pending `SIGTERM` that takes effect on
-   `SIGCONT`) has its socket torn down by the OS with a FIN or RST and no WS close
-   frame. The runtime records that within milliseconds as `1000` / `closed`; no
-   timer is involved. Seeing `1000` a few seconds after stopping a lender means the
-   lender died, not that the ping budget is shorter
-   ([#88](https://github.com/openabdev/openab-pty/issues/88)).
+   never reads them, so no pong comes back. SIGSTOP alone does not produce
+   `1000`. The runtime records **`1000` / `closed`** when it sees a clean WS
+   close, or when the transport reports EOF or an error, before the liveness
+   timer fires. It records the detach as soon as the transport reports the
+   closure; how long that takes depends on the network path, not on a runtime
+   timer. One reproduced cause is the lender's **process exiting** (a crash,
+   `SIGKILL`, `SIGHUP` without a handler, a pending `SIGTERM` that takes effect
+   on `SIGCONT`): the OS tears the socket down with a FIN or RST and no WS close
+   frame. A reset somewhere on the TCP path (a relay or sidecar) looks the same
+   to the runtime while the lender is still alive. A lender that loses power or
+   its network sends neither, and gets `4011`. So `1000` shortly after
+   stopping a lender says the connection closed; it does not by itself say why.
+   The exact cause of the event in
+   [#88](https://github.com/openabdev/openab-pty/issues/88) is unknown.
 4. Notifications you send (e.g. `notifications/tools/list_changed`) are accepted
    and dropped — there is no push channel toward the CLI. Requests you send are
    answered `-32601` except `ping`.
