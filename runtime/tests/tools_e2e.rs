@@ -718,6 +718,89 @@ async fn a_ping_silent_mac_is_closed_with_liveness_timeout_and_may_redial() {
     h.shutdown().await;
 }
 
+/// Issue openabdev/openab-pty#88: a lender whose process dies (killed, or a
+/// pending SIGTERM/SIGHUP taking effect) drops its TCP connection without a WS
+/// close frame. The runtime records that at once as `1000` / `closed`, with no
+/// timer involved, keeps the grant and accepts the redial. A lender that is
+/// only stopped keeps its socket open and gets `4011` (test above).
+#[tokio::test]
+#[ignore = "binds sockets and spawns a PTY child"]
+async fn a_lender_that_drops_its_socket_is_recorded_as_closed_at_once() {
+    let h = Harness::start(Duration::from_secs(60)).await;
+    let token = h.create("zeta").await;
+    let url = h.shell_tools_url("zeta", &token).await;
+    let secret = h.mint_tools("zeta").await;
+    let status_call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"instance_status","arguments":{}}});
+
+    let lender = ws_connect(
+        &format!("ws://{}/tools/attach/zeta", h.addr),
+        ("authorization", format!("Bearer {secret}")),
+    )
+    .await
+    .unwrap();
+    let mut attached = Value::Null;
+    for _ in 0..50 {
+        let (_, status) = mcp_post(&url, status_call.clone()).await;
+        attached = status["result"]["structuredContent"]["attached"].clone();
+        if attached == json!(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(attached, json!(true));
+
+    // Close the TCP stream under the WS layer: FIN, no close frame — what the
+    // runtime sees when the lender's process exits.
+    let raw = match lender.into_inner() {
+        tokio_tungstenite::MaybeTlsStream::Plain(stream) => stream,
+        _ => unreachable!("plain ws:// in tests"),
+    };
+    let dropped = std::time::Instant::now();
+    drop(raw);
+
+    let mut detached = Value::Null;
+    for _ in 0..100 {
+        let (_, status) = mcp_post(&url, status_call.clone()).await;
+        detached = status["result"]["structuredContent"].clone();
+        if !detached["last_detach_reason"].is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        dropped.elapsed() < openab_pty::tools::PING_INTERVAL / 4,
+        "detach took {:?}: a dropped socket must not wait for the ping budget",
+        dropped.elapsed()
+    );
+    assert_eq!(detached["attached"], json!(false), "{detached}");
+    assert_eq!(detached["grant_pending"], json!(true), "{detached}");
+    assert_eq!(detached["last_detach_reason"], json!("closed"));
+    assert_eq!(detached["last_detach_close_code"], json!(1000));
+    assert!(detached["hint"].as_str().unwrap().contains("redials"));
+
+    // The grant survived: the same secret redials and serves calls.
+    let again = fake_mac(h.addr, "zeta", &secret, "again")
+        .await
+        .expect("redial accepted");
+    let mut who = String::new();
+    for _ in 0..50 {
+        let (_, call) = mcp_post(&url, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sys_info","arguments":{}}})).await;
+        who = call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        if who == "fake mac again" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(who, "fake mac again");
+    h.admin("DELETE", "/admin/sessions/zeta/tools-attach", None)
+        .await;
+    assert_eq!(again.await.unwrap(), close_code::TOOLS_REVOKED);
+    h.shutdown().await;
+}
+
 /// Adversary: a shell in session A holds A's loopback URL and can watch A's
 /// traffic. It must not be able to mint for B, attach as B's Mac, or call B's
 /// tools — and it must not learn whether B exists by probing.
