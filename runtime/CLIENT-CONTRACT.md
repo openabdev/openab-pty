@@ -372,6 +372,22 @@ Text frames carry plain MCP JSON-RPC, no envelope:
    longest call and is closed mid-call. Missed pings count even while a request
    is in flight; the runtime cannot tell a busy Mac from a half-open TCP path any
    other way. `4011` leaves the grant valid, so redial.
+   A Mac that is **stopped but alive** (SIGSTOP, a debugger pause, a frozen
+   process) gets `4011` too: its kernel keeps ACKing pings, but the process
+   never reads them, so no pong comes back. SIGSTOP alone does not produce
+   `1000`. The runtime records **`1000` / `closed`** when it sees a clean WS
+   close, or when the transport reports EOF or an error, before the liveness
+   timer fires. It records the detach as soon as the transport reports the
+   closure; how long that takes depends on the network path, not on a runtime
+   timer. One reproduced cause is the lender's **process exiting** (a crash,
+   `SIGKILL`, `SIGHUP` without a handler, a pending `SIGTERM` that takes effect
+   on `SIGCONT`): the OS tears the socket down with a FIN or RST and no WS close
+   frame. A reset somewhere on the TCP path (a relay or sidecar) looks the same
+   to the runtime while the lender is still alive. A lender that loses power or
+   its network sends neither, and gets `4011`. So `1000` shortly after
+   stopping a lender says the connection closed; it does not by itself say why.
+   The exact cause of the event in
+   [#88](https://github.com/openabdev/openab-pty/issues/88) is unknown.
 4. Notifications you send (e.g. `notifications/tools/list_changed`) are accepted
    and dropped — there is no push channel toward the CLI. Requests you send are
    answered `-32601` except `ping`.
@@ -395,7 +411,7 @@ Close codes you will see on this socket:
 | 4006 | runtime replaced (pod/task) | back off, redial while the grant should still be valid; the verifier is gone with the pod, so expect `401` until re-minted |
 | 4010 | grant revoked by the admin plane | stop |
 | 4011 | liveness timeout: no frame (not even a pong) within the ping budget | redial with backoff while the grant is valid; fix whatever blocked your receive loop |
-| 1000 | you closed, or the socket dropped | redial with backoff while the grant is valid |
+| 1000 | you closed, or the socket dropped without a close frame (your process exited, or the TCP path reset) | redial with backoff while the grant is valid |
 
 Retry ownership is yours: redial for the remainder of the grant, with backoff,
 and give up on any 4xxx except 4006 and 4011. The pod cannot reach you.
@@ -440,7 +456,9 @@ does not edit any CLI's config; whatever installs the CLI does that. Properties:
   or, while nothing is attached,
   `{"attached": false, "grant_pending": bool, "last_detach_reason": …, "last_detach_close_code": …, "last_detach_secs_ago": …, "hint": "…"}`.
   `last_detach_reason` is `null` (never detached) or one of `liveness_timeout`,
-  `closed`, `revoked`, `ttl_expired` or `session_ended`; `runtime_replaced` and
+  `closed`, `revoked`, `ttl_expired` or `session_ended` (`closed`, code `1000`,
+  covers both a clean close from the Mac and a socket that dropped without a close
+  frame, e.g. because the Mac's process exited); `runtime_replaced` and
   `takeover` are reserved and not recorded today (a drain removes every socket
   before closing it, and a replaced socket does not record a detach because a
   newer one is attached). With `grant_pending: true`
