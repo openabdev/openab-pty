@@ -464,6 +464,9 @@ pub struct ServerConfig {
     /// Upper bound on a tools-attach grant (`POST /admin/sessions/{s}/tools-attach`).
     /// The endpoint defaults an omitted `ttl_secs` to one hour.
     pub tools_attach_ttl: Duration,
+    /// Liveness ping interval on tools-attach sockets. Production uses
+    /// [`tools::PING_INTERVAL`]; tests shorten it to observe a liveness close.
+    pub tools_ping_interval: Duration,
 }
 
 impl Default for ServerConfig {
@@ -474,6 +477,7 @@ impl Default for ServerConfig {
             drain_grace: Duration::from_secs(3),
             tick_interval: Duration::from_secs(1),
             tools_attach_ttl: tools::DEFAULT_TOOLS_ATTACH_MAX_TTL,
+            tools_ping_interval: tools::PING_INTERVAL,
         }
     }
 }
@@ -508,7 +512,10 @@ impl AppState {
         audit: AuditLogger,
         config: ServerConfig,
     ) -> Arc<Self> {
-        let tools = Arc::new(ToolsHub::new(config.tools_attach_ttl, audit.clone()));
+        let tools = Arc::new(
+            ToolsHub::new(config.tools_attach_ttl, audit.clone())
+                .with_ping_interval(config.tools_ping_interval),
+        );
         Arc::new(Self {
             manager,
             verifier,

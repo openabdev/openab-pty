@@ -250,6 +250,7 @@ async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()>
         drain_grace: Duration::from_secs(3),
         tick_interval: Duration::from_secs(1),
         tools_attach_ttl: projection.tools_attach_ttl,
+        tools_ping_interval: openab_pty::tools::PING_INTERVAL,
     };
     let tools_listen = projection.tools_listen.clone();
 

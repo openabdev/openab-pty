@@ -40,6 +40,10 @@ struct Harness {
 
 impl Harness {
     async fn start(tools_ttl: Duration) -> Self {
+        Self::start_with_ping(tools_ttl, openab_pty::tools::PING_INTERVAL).await
+    }
+
+    async fn start_with_ping(tools_ttl: Duration, tools_ping_interval: Duration) -> Self {
         let audit = AuditLogger;
         let generated = AdminAuthenticator::generate();
         let admin_credential =
@@ -94,6 +98,7 @@ tools_attach_ttl = "1h"
                 // Fast ticks so grant expiry is observable inside a test.
                 tick_interval: Duration::from_millis(50),
                 tools_attach_ttl: tools_ttl,
+                tools_ping_interval,
             },
         );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -600,6 +605,116 @@ async fn killing_the_session_ends_the_attach() {
     let (status, _) = h.admin("DELETE", "/admin/sessions/delta", None).await;
     assert_eq!(status, 200);
     assert_eq!(mac.await.unwrap(), close_code::SESSION_ENDED);
+    h.shutdown().await;
+}
+
+/// Issue openabdev/openab-pty#86: a Mac whose receive loop is blocked (a long
+/// tool call on a serial client) stops answering pings. The runtime closes it
+/// with a code that says so, keeps the grant, tells the agent to wait for the
+/// redial, and accepts the redial.
+#[tokio::test]
+#[ignore = "binds sockets and spawns a PTY child"]
+async fn a_ping_silent_mac_is_closed_with_liveness_timeout_and_may_redial() {
+    let ping = Duration::from_millis(200);
+    let h = Harness::start_with_ping(Duration::from_secs(60), ping).await;
+    let token = h.create("eps").await;
+    let url = h.shell_tools_url("eps", &token).await;
+    let secret = h.mint_tools("eps").await;
+    let status_call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"instance_status","arguments":{}}});
+
+    // A Mac that answers pings outlives the budget many times over.
+    let healthy = fake_mac(h.addr, "eps", &secret, "healthy").await.unwrap();
+    tokio::time::sleep(ping * 10).await;
+    let (_, status) = mcp_post(&url, status_call.clone()).await;
+    assert_eq!(
+        status["result"]["structuredContent"]["attached"],
+        json!(true)
+    );
+
+    // Replace it with a Mac that never reads, so it never answers a ping.
+    let stuck = ws_connect(
+        &format!("ws://{}/tools/attach/eps", h.addr),
+        ("authorization", format!("Bearer {secret}")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(healthy.await.unwrap(), close_code::TAKEOVER);
+    // Read the raw TCP stream: a WS client would queue a pong for every ping it
+    // reads, which is exactly what this Mac must not do. Unmasked server close
+    // frame: 0x88, payload length, then the code big-endian.
+    let mut raw = match stuck.into_inner() {
+        tokio_tungstenite::MaybeTlsStream::Plain(stream) => stream,
+        _ => unreachable!("plain ws:// in tests"),
+    };
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(IO_TIMEOUT, raw.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => bytes.extend_from_slice(&chunk[..n]),
+            Err(_) => panic!("the runtime never closed a ping-silent Mac"),
+        }
+    }
+    let [hi, lo] = close_code::LIVENESS_TIMEOUT.to_be_bytes();
+    assert!(
+        bytes
+            .windows(4)
+            .any(|w| w[0] == 0x88 && w[2] == hi && w[3] == lo),
+        "no close frame with code {} on the wire",
+        close_code::LIVENESS_TIMEOUT
+    );
+
+    // The agent is told why and what to do, not just grant_pending=true.
+    let mut detached = Value::Null;
+    for _ in 0..50 {
+        let (_, status) = mcp_post(&url, status_call.clone()).await;
+        detached = status["result"]["structuredContent"].clone();
+        if !detached["last_detach_reason"].is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(detached["attached"], json!(false), "{detached}");
+    assert_eq!(detached["grant_pending"], json!(true), "{detached}");
+    assert_eq!(detached["last_detach_reason"], json!("liveness_timeout"));
+    assert_eq!(
+        detached["last_detach_close_code"],
+        json!(close_code::LIVENESS_TIMEOUT)
+    );
+    assert!(detached["hint"].as_str().unwrap().contains("redials"));
+    let (_, call) = mcp_post(&url, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sys_info","arguments":{}}})).await;
+    assert_eq!(call["result"]["isError"], json!(true));
+    assert!(call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("redials"));
+
+    // The grant survived: the same secret redials and serves calls.
+    let again = fake_mac(h.addr, "eps", &secret, "again")
+        .await
+        .expect("redial accepted");
+    let mut who = String::new();
+    for _ in 0..50 {
+        let (_, call) = mcp_post(&url, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sys_info","arguments":{}}})).await;
+        who = call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        if who == "fake mac again" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(who, "fake mac again");
+
+    // A revoke reads differently: no grant, ask the human.
+    h.admin("DELETE", "/admin/sessions/eps/tools-attach", None)
+        .await;
+    assert_eq!(again.await.unwrap(), close_code::TOOLS_REVOKED);
+    let (_, status) = mcp_post(&url, status_call).await;
+    let revoked = &status["result"]["structuredContent"];
+    assert_eq!(revoked["grant_pending"], json!(false), "{revoked}");
+    assert_eq!(revoked["last_detach_reason"], json!("revoked"));
     h.shutdown().await;
 }
 

@@ -111,6 +111,11 @@ pub mod close_code {
     /// Distinct from [`TTL_EXPIRED`] and [`ADMIN_KILL`]: the session lives on,
     /// only the lent hands were withdrawn. Tools socket only.
     pub const TOOLS_REVOKED: u16 = 4010;
+    /// The attached Mac sent no frame of any kind (not even a pong) for longer
+    /// than the ping budget. Distinct from a normal `1000` so both sides' logs
+    /// name the real cause; the grant is untouched and the Mac should redial.
+    /// Tools socket only.
+    pub const LIVENESS_TIMEOUT: u16 = 4011;
 }
 
 /// Errors surfaced across module boundaries.

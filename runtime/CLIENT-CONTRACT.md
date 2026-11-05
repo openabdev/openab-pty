@@ -219,6 +219,7 @@ cannot make it for you without ceasing to be a terminal.
 | 4008 | operator killed it | say so plainly |
 | 4009 | internal fault | do not invite retry-create |
 | 4010 | tools grant revoked (tools socket only, §9) | the session lives; the lent Mac was withdrawn |
+| 4011 | liveness timeout: no frame within the ping budget (tools socket only, §9) | redial with backoff; the grant is untouched |
 | **1006** | **the browser/WS layer never opened** | see below |
 
 `1006` is not ours. It is what a client reports when the upgrade itself was
@@ -363,8 +364,14 @@ Text frames carry plain MCP JSON-RPC, no envelope:
 2. Every `tools/list`, `tools/call` and any other request the CLI issues arrives
    with a runtime-assigned integer `id`. Reply with the same `id`. Ids are
    rewritten on both sides; never assume they match the CLI's.
-3. The runtime pings every 20 s and closes after three intervals with no inbound
-   frame. Answer WS pings (any library does); nothing else is required.
+3. The runtime pings every 20 s and closes with **`4011`** after more than three
+   intervals (60–80 s) with no inbound frame of any kind. Answer WS pings (any
+   library does); nothing else is required. A ping is answered only while your WS
+   layer is reading, so **keep a receive outstanding while a tool call runs**: a
+   client that handles one frame at a time goes silent for the length of its
+   longest call and is closed mid-call. Missed pings count even while a request
+   is in flight; the runtime cannot tell a busy Mac from a half-open TCP path any
+   other way. `4011` leaves the grant valid, so redial.
 4. Notifications you send (e.g. `notifications/tools/list_changed`) are accepted
    and dropped — there is no push channel toward the CLI. Requests you send are
    answered `-32601` except `ping`.
@@ -387,10 +394,11 @@ Close codes you will see on this socket:
 | 4004 | the session ended (killed, exited, expired) | stop; nothing to attach to |
 | 4006 | runtime replaced (pod/task) | back off, redial while the grant should still be valid; the verifier is gone with the pod, so expect `401` until re-minted |
 | 4010 | grant revoked by the admin plane | stop |
+| 4011 | liveness timeout: no frame (not even a pong) within the ping budget | redial with backoff while the grant is valid; fix whatever blocked your receive loop |
 | 1000 | you closed, or the socket dropped | redial with backoff while the grant is valid |
 
 Retry ownership is yours: redial for the remainder of the grant, with backoff,
-and give up on any 4xxx except 4006. The pod cannot reach you.
+and give up on any 4xxx except 4006 and 4011. The pod cannot reach you.
 
 ### 9.3 The CLI: `$OPENAB_TOOLS_MCP_URL`
 
@@ -429,9 +437,18 @@ does not edit any CLI's config; whatever installs the CLI does that. Properties:
   were lent" from "the endpoint is broken".
 - `tools/call instance_status` →
   `{"attached": true, "peer": …, "server": {serverInfo}, "grant_expires_in_secs": …}`
-  or `{"attached": false, "grant_pending": bool}`.
+  or, while nothing is attached,
+  `{"attached": false, "grant_pending": bool, "last_detach_reason": …, "last_detach_close_code": …, "last_detach_secs_ago": …, "hint": "…"}`.
+  `last_detach_reason` is `null` (never detached) or one of `liveness_timeout`,
+  `closed`, `revoked`, `ttl_expired` or `session_ended`; `runtime_replaced` and
+  `takeover` are reserved and not recorded today (a drain removes every socket
+  before closing it, and a replaced socket does not record a detach because a
+  newer one is attached). With `grant_pending: true`
+  the Mac is expected to redial on its own; `hint` tells the agent to wait and
+  check again rather than ask the human to lend the Mac again.
 - `tools/call <anything else>` while not attached → a **tool** result with
-  `isError: true` and a message telling the agent to ask the human, rather than a
+  `isError: true` and a message telling the agent to wait for the redial (grant
+  still valid) or to ask the human (no grant), rather than a
   protocol error that would make an MCP client tear the server down.
 - Mac unreachable mid-call → JSON-RPC error `-32001` (not attached), `-32002`
   (too many in flight), `-32003` (timeout). The socket is torn down and the next
@@ -568,8 +585,8 @@ never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 1. Operator: `POST /admin/sessions/{s}/tools-attach`, hand `secret` to the Mac.
 2. Mac: open `ws(s)://<runtime>/tools/attach/{s}` with `Authorization: Bearer <secret>`.
 3. Mac: answer `initialize`, then serve `tools/list` / `tools/call` as an MCP server.
-4. Mac: on close 1000/4006 redial with backoff while the grant is valid; on any
-   other 4xxx stop.
+4. Mac: on close 1000/4006/4011 redial with backoff while the grant is valid; on
+   any other 4xxx stop.
 5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
 
 The CLI side is zero steps: on a variant the image's startup hook knows (today

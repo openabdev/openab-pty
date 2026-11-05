@@ -104,6 +104,7 @@ impl Harness {
                 drain_grace: Duration::ZERO,
                 tick_interval: Duration::from_secs(1),
                 tools_attach_ttl: Duration::from_secs(60),
+                tools_ping_interval: openab_pty::tools::PING_INTERVAL,
             },
         );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
