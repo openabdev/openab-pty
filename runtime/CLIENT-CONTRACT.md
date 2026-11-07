@@ -413,8 +413,26 @@ Close codes you will see on this socket:
 | 4011 | liveness timeout: no frame (not even a pong) within the ping budget | redial with backoff while the grant is valid; fix whatever blocked your receive loop |
 | 1000 | you closed, or the socket dropped without a close frame (your process exited, or the TCP path reset) | redial with backoff while the grant is valid |
 
-Retry ownership is yours: redial for the remainder of the grant, with backoff,
-and give up on any 4xxx except 4006 and 4011. The pod cannot reach you.
+Retry ownership is yours: redial for the remainder of the grant, with backoff.
+Stop only on the close codes the table marks stop (4001, 4002, 4004, 4010);
+the handshake statuses that stop are in the next table. Redial on every other
+close code, including `1006` and codes this table does not list. The runtime
+never sends `1006`: your WebSocket library reports it locally when the socket
+drops without a close frame. This socket never sends `4003` either (that is
+`/pty`'s renew code, §5), and when the runtime added `4011` the lenders that
+redial by default needed no change. A redial against a grant that is gone ends
+at the handshake `401` below. The pod cannot reach you.
+
+Handshake status on the upgrade:
+
+| Status | From | Dialer action |
+|---|---|---|
+| `101` / other `2xx` | `101` is a normal upgrade; another `2xx` means something answered without upgrading | redial with backoff if the socket does not come up |
+| `401` | any credential, grant or session problem (above) | stop; a human must mint again |
+| `429` (with `Retry-After`) | the per-source upgrade throttle | wait, then redial |
+| `503` | the runtime is draining for shutdown | back off, redial |
+| other `5xx` | the runtime or a proxy in front of it is unwell | back off, redial |
+| anything else (`400`, `403`, `404`, …) | a malformed upgrade, a wrong URL, or a proxy refusing it | stop and report it; a redial will not change it |
 
 ### 9.3 The CLI: `$OPENAB_TOOLS_MCP_URL`
 
@@ -603,8 +621,10 @@ never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 1. Operator: `POST /admin/sessions/{s}/tools-attach`, hand `secret` to the Mac.
 2. Mac: open `ws(s)://<runtime>/tools/attach/{s}` with `Authorization: Bearer <secret>`.
 3. Mac: answer `initialize`, then serve `tools/list` / `tools/call` as an MCP server.
-4. Mac: on close 1000/4006/4011 redial with backoff while the grant is valid; on
-   any other 4xxx stop.
+4. Mac: on close 4001/4002/4004/4010, or a handshake status other than
+   `101`/`2xx`/`429`/`5xx`, stop. On any other close (1000, 1006, 4006, 4011,
+   an unlisted code), `101`/`2xx`, `429` or `5xx`, redial with backoff while
+   the grant is valid.
 5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
 
 The CLI side is zero steps: on a variant the image's startup hook knows (today
