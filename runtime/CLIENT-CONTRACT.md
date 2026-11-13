@@ -2,7 +2,8 @@
 
 Implementation spec for a native client (macOS first, then iOS). Every shape
 below was captured from the running Phase 1 runtime, not transcribed from the
-source, so it reflects what a client will actually receive.
+source, so it reflects what a client will actually receive. One exception,
+marked where it stands: §10 describes a plane the runtime is not a party to.
 
 **Status:** implementation spec, not a tutorial. It describes the wire contract a
 client must satisfy; it does not walk a user through using one.
@@ -630,3 +631,66 @@ never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 The CLI side is zero steps: on a variant the image's startup hook knows (today
 `kiro-cli`) the `computer` server is already configured and trusted; on any
 other, the URL is already in its environment.
+
+## 10. Shepherd plane — supervising the agent from the client (optional, client-side only)
+
+This section is **not** part of the runtime's wire contract. The shapes in
+§§1–9 were captured from the running runtime; this one was not, because the
+runtime is not a party to it. Nothing here is a request the runtime receives,
+a response it sends, or state it keeps. It is recorded in this contract
+because the client is the one place the two planes meet, and a reader should
+not have to guess how they combine.
+
+[openab-shepherd](https://github.com/openabdev/openab-shepherd) is a separate
+MCP server that runs coding CLIs (Kiro, Devin, OpenCode) in terminal panes it
+owns: it starts the agent, reports its status (`working` / `blocked` /
+`done`, with a turn counter), reads its screen, types prompts, and answers
+permission dialogs under rules it enforces. The integration reference lives
+on the Shepherd side:
+[terminal clients](https://github.com/openabdev/openab-shepherd/blob/main/docs/terminal-clients.md).
+
+A client may hold both planes at once:
+
+| Plane | Server | The client gets |
+|---|---|---|
+| Attach (§4) | this runtime | the operator's own shell |
+| Shepherd (this section) | openab-shepherd, deployed separately | the agent's status, screen and dialogs |
+
+**Deployment.** Shepherd runs beside the agent — same pod, image and
+workspace the session exposes — and the agent run being supervised is the
+one Shepherd started with `start_pane`. The attach session remains the
+operator's own shell into that workspace, for inspection and hands-on work;
+it is a different terminal from the agent's pane. Shepherd binds loopback
+only; a client on another machine reaches it over the tailnet through
+`tailscale serve`, as Shepherd's operations reference describes. This
+runtime neither proxies that traffic nor knows it happened.
+
+**What the client stores.** §1's two values, plus — only in a client that
+implements this section — the Shepherd bearer token, in the Keychain with
+the same handling as the admin credential. Three credentials, none shared:
+the admin credential (§1), attach tokens (§4), and the Shepherd token. The
+runtime never receives the Shepherd token; Shepherd never receives the
+other two. One Shepherd token controls every pane that server owns, which
+is why it is stored like the admin credential and not like an attach token.
+
+**Client behaviour over the plane.** All of it is ordinary MCP
+(`POST /mcp`, `Authorization: Bearer <shepherd-token>`) against Shepherd's
+nine tools, under Shepherd's rules, which the client does not get to relax:
+
+- List panes (`list_panes`) and show each pane's status (`get_status`, or
+  hold a `wait_status` call open) as the agent's status line.
+- Show the agent's screen with `read_output` — text, not a byte stream; it
+  carries none of §4.1's renderer hazards and none of its fidelity either.
+- Send a prompt with `send_input` — the nudge. Shepherd refuses it while
+  the pane is blocked on a dialog. Surface the refusal; do not treat the
+  attach session as a side channel into the pane, because it is a different
+  terminal.
+- Answer a permission dialog with `answer_dialog`. Shepherd offers
+  `allow_once` and `deny_once` only; a client must not present an
+  "always allow" control the server will never honour.
+- Stop or end a run with `interrupt_pane` / `remove_pane`.
+
+**Conformance.** This plane is optional in full. A client that implements
+only §§1–9 is a complete, conformant client — the minimum viable client in
+§8 is unchanged — and nothing in the runtime's behaviour differs when a
+client also talks to Shepherd. The runtime cannot tell whether one does.
