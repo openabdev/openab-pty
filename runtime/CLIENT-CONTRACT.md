@@ -2,7 +2,9 @@
 
 Implementation spec for a native client (macOS first, then iOS). Every shape
 below was captured from the running Phase 1 runtime, not transcribed from the
-source, so it reflects what a client will actually receive.
+source, so it reflects what a client will actually receive. One exception,
+marked where it stands: §10 is a design proposal — session-state reporting
+and floor arbitration — rather than behaviour captured from the running runtime.
 
 **Status:** implementation spec, not a tutorial. It describes the wire contract a
 client must satisfy; it does not walk a user through using one.
@@ -630,3 +632,85 @@ never needs this ([#39](https://github.com/openabdev/openab-pty/issues/39)).
 The CLI side is zero steps: on a variant the image's startup hook knows (today
 `kiro-cli`) the `computer` server is already configured and trusted; on any
 other, the URL is already in its environment.
+
+## 10. Shared session and floor control — Shepherd as an outer layer (optional, proposed)
+
+This section is **not** part of the runtime's captured wire contract. The
+shapes in §§1–9 were captured from the running runtime; this one is a design
+proposal, recorded here because it changes what a client may assume. It has
+two halves: proposed runtime behaviour — session-state reporting and
+input-floor arbitration — and the way a client and
+[openab-shepherd](https://github.com/openabdev/openab-shepherd) combine over
+one shared session. An earlier draft of this section specified a
+client-side-only plane in which Shepherd owned separate panes; this version
+replaces that model. Shepherd's pane-owning mode remains available to
+deployments that prefer strict separation; nothing below requires it.
+
+**The model.** One session, one PTY stream, two kinds of writer. The
+operator attaches as in §4 and drives the terminal directly — native
+rendering at the client's own geometry, keystrokes unmediated, takeover at
+any moment. The agent CLI runs as the foreground program of that same
+session. Shepherd does not own a second terminal in this model; it acts as
+an outer layer, in the style of a routine: it observes the session, and at
+the right moments submits a message to be typed into it — a resume, a
+nudge, the next task — the way a routine hands work to a bot.
+
+![Shared session + floor control](images/floor-control-en.png)
+
+![共享 Session ＋ Floor Control](images/floor-control-zh.png)
+
+**Session state.** The runtime tracks and reports, per session: `working`
+(a turn is in progress), `idle` (the turn has ended and the foreground
+program is waiting at its prompt), `blocked` (the foreground program is
+waiting on a permission dialog or an equivalent modal prompt), and whether
+a human is present (an attach client is connected and has sent input
+recently). State must rest on a hard signal where the CLI offers one (for
+example an OSC status sequence). Output quietness alone never establishes
+`idle`: an agent mid-turn can produce no output for a long stretch, and a
+submission made on that guess lands inside a running turn.
+
+**Floor arbitration.** Shepherd never writes to the PTY itself. It submits
+a message and requests the input floor; the runtime grants the floor only
+when all of the following hold:
+
+- the session state is `idle` — turn ended, prompt waiting;
+- no human input within the presence window, or no attach client connected;
+- the foreground program is the agent CLI. At a bare shell prompt the floor
+  is never granted: a submitted message there is a shell command, not a
+  prompt, and this mechanism does not execute shell commands.
+
+On grant, the runtime writes the message as a single atomic write
+(bracketed paste where the program asks for it) followed by its submission
+keystroke. The floor is revoked the moment a turn starts or a human
+keystroke arrives, whichever comes first. An injection is therefore
+all-or-nothing and cannot interleave with operator typing.
+
+**Blocked is not idle.** While the state is `blocked`, free-form submission
+is refused outright. The only automation permitted against a dialog is
+answering it under the dialog discipline: `allow_once` and `deny_once`
+only, and never an "always allow" affordance. A refusal is surfaced to the
+operator, not retried around.
+
+**The operator is never gated.** Floor control constrains the automation
+layer only. The operator's attach stream (§4) is never throttled, queued or
+refused by this mechanism, and the runtime cannot distinguish the operator's
+keystrokes from a reason to revoke the floor — they are simply senior to
+it. Policy in this section governs Shepherd and routines, not the owner's
+hands at their own terminal.
+
+**Audit.** Every granted injection is recorded — submitting identity,
+source routine where known, timestamp, message — and the record is visible
+to attach clients. Injected text is indistinguishable from typed text in
+the stream itself; the audit record is where its provenance lives.
+
+**What the client stores.** §1's two values, plus — only in a client that
+implements this section — the Shepherd bearer <redacted>, in the Keychain with
+the same handling as the admin credential. Three credentials, none shared:
+the admin credential (§1), attach tokens (§4), and the Shepherd automation
+credential, which the runtime accepts only for state reads and floor
+requests and which confers no admin or attach rights.
+
+**Conformance.** This section is optional in full. A runtime that does not
+implement it is described completely by §§1–9; a client that implements
+only §§1–9 remains a complete, conformant client, and §8's minimum viable
+client is unchanged.
